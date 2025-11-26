@@ -18,7 +18,7 @@ jobs:
         with:
           host: 147.79.66.3
           username: root
-          password: ${{ secrets.VPS_PASSWORD }}
+          key: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
           script: |
             echo "=========================================="
             echo "Starting TingaTalk Backend Deployment..."
