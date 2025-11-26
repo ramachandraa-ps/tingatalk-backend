@@ -1,0 +1,46 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: 147.79.66.3
+          username: root
+          password: ${{ secrets.VPS_PASSWORD }}
+          script: |
+            echo "=========================================="
+            echo "Starting TingaTalk Backend Deployment..."
+            echo "=========================================="
+
+            cd /var/www/tingatalk-backend
+
+            echo "Pulling latest changes..."
+            git pull origin main
+
+            echo "Installing dependencies..."
+            npm install --production
+
+            echo "Restarting PM2 process..."
+            pm2 restart tingatalk-backend || pm2 start ecosystem.config.js --env production
+
+            echo "Saving PM2 process list..."
+            pm2 save
+
+            echo "=========================================="
+            echo "Deployment completed successfully!"
+            echo "=========================================="
+
+            echo "Current PM2 status:"
+            pm2 status

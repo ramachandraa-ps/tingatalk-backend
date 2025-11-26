@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+
+# Environment variables (contains secrets)
+.env
+.env.local
+.env.production
+
+# Firebase credentials (sensitive - add manually to VPS)
+firebase_service_account.json
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Backup files
+*.backup_*
+*backup_*
+*.before_*
+
+# PM2
+.pm2/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Server backup files
+server.js.before_*
+server.js.backup*
