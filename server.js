@@ -898,7 +898,8 @@ app.get('/api/get_available_females', async (req, res) => {
 
     logger.info(`📋 Found ${femalesSnapshot.docs.length} females with isAvailable=true in Firestore`);
 
-    // STEP 2: Filter by active WebSocket connection
+    // STEP 2: Check connection status and FCM reachability
+    // 🆕 ENHANCED: Include FCM-reachable users (background mode)
     const availableFemales = [];
 
     for (const doc of femalesSnapshot.docs) {
@@ -922,15 +923,32 @@ app.get('/api/get_available_females', async (req, res) => {
         logger.info(`📋   - Socket connected: ${isSocketConnected}`);
       }
 
-      // Check if user is available (WebSocket OR isOnline in Firestore)
-      const isOnlineInFirestore = userData.isOnline === true;
-      const isAvailable = isSocketConnected || isOnlineInFirestore;
+      // 🆕 Check if user has FCM token (can receive push notifications)
+      const hasFcmToken = !!(userData.fcmToken && userData.fcmToken.length > 0);
+      logger.info(`📋   - Has FCM token: ${hasFcmToken}`);
 
-      logger.info(`📋   - Is online in Firestore: ${isOnlineInFirestore}`);
-      logger.info(`📋   - Final availability decision: ${isAvailable ? 'AVAILABLE' : 'NOT AVAILABLE'}`);
+      // 🆕 REACHABILITY LOGIC:
+      // - 'websocket': Active WebSocket connection (app in foreground)
+      // - 'fcm': Has FCM token, no WebSocket (app in background)
+      // - 'offline': No WebSocket, no FCM token (completely offline)
+      let reachability = 'offline';
+      if (isSocketConnected) {
+        reachability = 'websocket';
+      } else if (hasFcmToken) {
+        reachability = 'fcm';
+      }
 
-      if (!isAvailable) {
-        logger.info(`📋 Skipping user ${userId} (${userData.name}) - not available (no WebSocket and not online in Firestore)`);
+      logger.info(`📋   - Reachability: ${reachability}`);
+
+      // 🆕 CRITICAL FIX: Include users who are reachable via WebSocket OR FCM
+      // Firestore isAvailable=true means user has toggle ON (wants to receive calls)
+      // They should appear in browse list if reachable by any method
+      const isReachable = reachability !== 'offline';
+
+      logger.info(`📋   - Final availability decision: ${isReachable ? 'REACHABLE' : 'NOT REACHABLE'}`);
+
+      if (!isReachable) {
+        logger.info(`📋 Skipping user ${userId} (${userData.name}) - not reachable (no WebSocket and no FCM token)`);
         continue;
       }
 
@@ -1011,14 +1029,16 @@ app.get('/api/get_available_females', async (req, res) => {
       }
 
       // STEP 4: Build user object with all required fields
+      // 🆕 ENHANCED: Include reachability status for UI indicators
       const userObject = {
         userId: userId,
         name: userData.name || 'Unknown',
         age: userData.age || 0,
         photoUrl: userData.photoUrl || '',
         fullPhotoUrl: userData.fullPhotoUrl || userData.photoUrl || '',
-        isOnline: true, // Always true since we filtered by connection
-        isAvailable: true, // Always true since we filtered by availability
+        isOnline: reachability === 'websocket', // True only if WebSocket connected
+        isAvailable: true, // Always true since we filtered by Firestore isAvailable
+        reachability: reachability, // 'websocket', 'fcm', or 'offline'
         rating: powerUpStats.rating,
         totalCalls: powerUpStats.totalCalls,
         totalLikes: powerUpStats.totalLikes,
