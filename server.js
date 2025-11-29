@@ -1840,15 +1840,49 @@ io.on('connection', (socket) => {
       }
     }
 
-    // If no connection, always unavailable
-    if (!hasConnection) {
-      actualStatus = 'unavailable';
+    // 🔧 NEW: Check if user has toggle ON in Firestore (even without WebSocket)
+    let hasToggleOn = false;
+    let hasFcmToken = false;
+    let callerName = 'Someone';
+
+    // Get caller name for notification
+    try {
+      const callerDoc = await scalability.firestore.collection('users').doc(callerId).get();
+      if (callerDoc.exists) {
+        callerName = callerDoc.data()?.name || 'Someone';
+      }
+    } catch (e) {
+      logger.warn(`⚠️ Could not get caller name: ${e.message}`);
     }
 
-    logger.info(`📞 Recipient ${recipientId} actual status: ${actualStatus} (connection: ${recipientConnection && recipientConnection.isOnline ? 'YES' : 'NO'})`);
+    // If no WebSocket connection, check Firestore for availability preference
+    if (!hasConnection) {
+      try {
+        const recipientDoc = await scalability.firestore.collection('users').doc(recipientId).get();
+        if (recipientDoc.exists) {
+          const recipientData = recipientDoc.data();
+          hasToggleOn = recipientData.isAvailable === true;
+          hasFcmToken = !!recipientData.fcmToken && recipientData.fcmToken.length > 0;
+          logger.info(`📞 Recipient Firestore check: isAvailable=${hasToggleOn}, hasFcmToken=${hasFcmToken}`);
+        }
+      } catch (e) {
+        logger.warn(`⚠️ Could not check recipient Firestore data: ${e.message}`);
+      }
 
-    // 🆕 PRODUCTION: Check if recipient is available (not busy)
-    if (actualStatus !== 'available') {
+      // If toggle is ON and has FCM token, we can try push notification
+      if (hasToggleOn && hasFcmToken) {
+        actualStatus = 'fcm_reachable'; // Special status for FCM-reachable users
+        logger.info(`📞 Recipient ${recipientId} is FCM-reachable (toggle ON, has FCM token)`);
+      } else {
+        actualStatus = 'unavailable';
+        logger.info(`📞 Recipient ${recipientId} is unavailable (toggle: ${hasToggleOn}, fcm: ${hasFcmToken})`);
+      }
+    }
+
+    logger.info(`📞 Recipient ${recipientId} actual status: ${actualStatus} (connection: ${hasConnection ? 'YES' : 'NO'})`);
+
+    // 🆕 PRODUCTION: Check if recipient is available or FCM-reachable
+    if (actualStatus !== 'available' && actualStatus !== 'fcm_reachable') {
       logger.warn(`📞 Call blocked: Recipient ${recipientId} is ${actualStatus}`);
 
       socket.emit('call_failed', {
@@ -1931,6 +1965,22 @@ io.on('connection', (socket) => {
       io.to(recipientSocketId).emit('incoming_call', incomingCallPayload);
       logger.info(`📡 ✅ incoming_call emitted to recipient only`);
 
+      // 🔧 ALSO send FCM as backup (in case app goes to background during call initiation)
+      try {
+        const fcmBackup = await scalability.sendIncomingCallNotification(recipientId, {
+          callId: finalCallId,
+          callerId: callerId,
+          callerName: callerName,
+          roomName: finalRoomName,
+          callType: callType,
+        });
+        if (fcmBackup) {
+          logger.info(`📱 Backup FCM notification also sent to ${recipientId}`);
+        }
+      } catch (fcmError) {
+        logger.warn(`⚠️ Backup FCM failed (non-critical): ${fcmError.message}`);
+      }
+
       call.status = 'ringing';
       call.recipientOnline = true;
       call.recipientSocketId = recipientSocketId;
@@ -1972,16 +2022,85 @@ io.on('connection', (socket) => {
       }, 30000); // 30 seconds
       
     } else {
-      call.status = 'failed';
-      call.recipientOnline = false;
-      call.failureReason = 'Recipient is offline';
+      // 🔧 NEW: Recipient not connected via WebSocket - try FCM push notification
+      logger.info(`📞 Recipient ${recipientId} not connected via WebSocket - attempting FCM push notification`);
 
-      logger.warn(`📞 Call failed: ${finalCallId} - Recipient ${recipientId} is offline`);
-      
-      socket.emit('call_failed', {
-        callId: finalCallId,
-        reason: 'Recipient is offline'
-      });
+      // Check if we determined earlier that recipient is FCM-reachable
+      if (actualStatus === 'fcm_reachable') {
+        logger.info(`📱 Sending FCM push notification to ${recipientId}...`);
+
+        // Send FCM notification
+        const fcmSent = await scalability.sendIncomingCallNotification(recipientId, {
+          callId: finalCallId,
+          callerId: callerId,
+          callerName: callerName,
+          roomName: finalRoomName,
+          callType: callType,
+        });
+
+        if (fcmSent) {
+          logger.info(`✅ FCM notification sent successfully to ${recipientId}`);
+
+          // Mark call as "pending_fcm" - waiting for recipient to open app
+          call.status = 'pending_fcm';
+          call.recipientOnline = false;
+          call.fcmSent = true;
+          call.fcmSentAt = new Date();
+
+          // Notify caller that call is ringing (via FCM)
+          socket.emit('call_initiated', {
+            callId: finalCallId,
+            roomName: finalRoomName,
+            status: 'ringing_fcm',
+            recipientOnline: false,
+            fcmSent: true,
+            message: 'Push notification sent to recipient'
+          });
+
+          // Set longer timeout for FCM calls (60 seconds)
+          setTimeout(() => {
+            const currentCall = activeCalls.get(finalCallId);
+            if (currentCall && (currentCall.status === 'pending_fcm' || currentCall.status === 'ringing')) {
+              logger.warn(`⏱️ FCM Call timeout: ${finalCallId} - No response from ${recipientId}`);
+
+              // Notify caller
+              socket.emit('call_timeout', {
+                callId: finalCallId,
+                reason: 'No response from recipient (FCM)',
+              });
+
+              // Mark call as timed out and remove
+              currentCall.status = 'timeout';
+              currentCall.timeoutAt = new Date();
+              deleteActiveCallSync(finalCallId);
+            }
+          }, 60000); // 60 seconds for FCM calls
+
+        } else {
+          // FCM send failed
+          logger.warn(`❌ FCM notification failed for ${recipientId}`);
+          call.status = 'failed';
+          call.recipientOnline = false;
+          call.failureReason = 'FCM notification failed';
+
+          socket.emit('call_failed', {
+            callId: finalCallId,
+            reason: 'Could not reach recipient',
+          });
+        }
+      } else {
+        // Not FCM-reachable - completely offline
+        call.status = 'failed';
+        call.recipientOnline = false;
+        call.failureReason = 'Recipient is offline';
+
+        logger.warn(`📞 Call failed: ${finalCallId} - Recipient ${recipientId} is completely offline`);
+
+        socket.emit('call_failed', {
+          callId: finalCallId,
+          reason: 'Recipient is offline',
+        });
+      }
     }
   });
 

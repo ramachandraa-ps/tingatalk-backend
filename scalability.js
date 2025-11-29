@@ -15,6 +15,7 @@ class ScalabilityManager {
     this.redisPub = null;
     this.redisSub = null;
     this.firestore = null;
+    this.messaging = null; // FCM Messaging instance
     this.initialized = false;
   }
 
@@ -52,13 +53,17 @@ class ScalabilityManager {
       }
 
       this.firestore = admin.firestore();
-      
+
+      // Initialize FCM Messaging
+      this.messaging = admin.messaging();
+      this.logger.info('✅ FCM Messaging initialized');
+
       // Test connection
       await this.firestore.collection('_health_check').doc('test').set({
         timestamp: admin.firestore.FieldValue.serverTimestamp(),
         status: 'ok'
       });
-      
+
       this.logger.info('✅ Firestore connection test successful');
       
     } catch (error) {
@@ -382,6 +387,151 @@ class ScalabilityManager {
     } catch (error) {
       this.logger.error(`❌ Error getting user balance: ${error.message}`);
       return null;
+    }
+  }
+
+  // ============================================================================
+  // FCM PUSH NOTIFICATIONS
+  // ============================================================================
+
+  /**
+   * Send FCM push notification for incoming call
+   * @param {string} userId - Recipient user ID
+   * @param {object} callData - Call details (callId, callerId, callerName, roomName, callType)
+   * @returns {Promise<boolean>} - True if sent successfully
+   */
+  async sendIncomingCallNotification(userId, callData) {
+    if (!this.messaging) {
+      this.logger.warn('⚠️ FCM Messaging not initialized, cannot send notification');
+      return false;
+    }
+
+    if (!this.firestore) {
+      this.logger.warn('⚠️ Firestore not initialized, cannot get FCM token');
+      return false;
+    }
+
+    try {
+      // Get user's FCM token from Firestore
+      const userDoc = await this.firestore.collection('users').doc(userId).get();
+
+      if (!userDoc.exists) {
+        this.logger.warn(`⚠️ User ${userId} not found in Firestore`);
+        return false;
+      }
+
+      const userData = userDoc.data();
+      const fcmToken = userData.fcmToken;
+
+      if (!fcmToken) {
+        this.logger.warn(`⚠️ No FCM token for user ${userId}`);
+        return false;
+      }
+
+      this.logger.info(`📱 Sending FCM notification to user ${userId}`);
+      this.logger.info(`📱 FCM Token: ${fcmToken.substring(0, 20)}...`);
+
+      // Build the FCM message
+      const message = {
+        token: fcmToken,
+        notification: {
+          title: 'Incoming Call',
+          body: `${callData.callerName || 'Someone'} is calling you...`,
+        },
+        data: {
+          // Include both camelCase and snake_case for compatibility
+          type: 'incoming_call',
+          callId: callData.callId || '',
+          call_id: callData.callId || '',
+          callerId: callData.callerId || '',
+          caller_id: callData.callerId || '',
+          callerName: callData.callerName || 'Unknown',
+          caller_name: callData.callerName || 'Unknown',
+          roomName: callData.roomName || '',
+          room_name: callData.roomName || '',
+          callType: callData.callType || 'video',
+          call_type: callData.callType || 'video',
+          recipientId: userId,
+          recipient_id: userId,
+          timestamp: new Date().toISOString(),
+        },
+        android: {
+          priority: 'high',
+          ttl: 60000, // 60 seconds TTL
+          notification: {
+            channelId: 'incoming_calls',
+            priority: 'max',
+            defaultSound: true,
+            defaultVibrateTimings: true,
+            visibility: 'public',
+            clickAction: 'FLUTTER_NOTIFICATION_CLICK',
+          },
+        },
+        apns: {
+          headers: {
+            'apns-priority': '10', // High priority
+            'apns-push-type': 'alert',
+          },
+          payload: {
+            aps: {
+              alert: {
+                title: 'Incoming Call',
+                body: `${callData.callerName || 'Someone'} is calling you...`,
+              },
+              sound: 'default',
+              badge: 1,
+              'content-available': 1,
+              'mutable-content': 1,
+              'interruption-level': 'time-sensitive',
+            },
+          },
+        },
+      };
+
+      // Send the notification
+      const response = await this.messaging.send(message);
+      this.logger.info(`✅ FCM notification sent successfully: ${response}`);
+      return true;
+
+    } catch (error) {
+      this.logger.error(`❌ FCM send error for user ${userId}:`, error.message);
+
+      // Handle specific FCM errors
+      if (error.code === 'messaging/invalid-registration-token' ||
+          error.code === 'messaging/registration-token-not-registered') {
+        this.logger.warn(`⚠️ Invalid/expired FCM token for user ${userId} - clearing token`);
+        // Clear invalid token from Firestore
+        try {
+          await this.firestore.collection('users').doc(userId).update({
+            fcmToken: admin.firestore.FieldValue.delete(),
+            fcmTokenInvalidAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        } catch (clearError) {
+          this.logger.error(`❌ Failed to clear invalid FCM token: ${clearError.message}`);
+        }
+      }
+
+      return false;
+    }
+  }
+
+  /**
+   * Check if user has valid FCM token
+   * @param {string} userId - User ID to check
+   * @returns {Promise<boolean>} - True if user has FCM token
+   */
+  async hasValidFCMToken(userId) {
+    if (!this.firestore) return false;
+
+    try {
+      const userDoc = await this.firestore.collection('users').doc(userId).get();
+      if (!userDoc.exists) return false;
+
+      const fcmToken = userDoc.data()?.fcmToken;
+      return !!fcmToken && fcmToken.length > 0;
+    } catch (error) {
+      this.logger.error(`❌ Error checking FCM token for user ${userId}: ${error.message}`);
+      return false;
     }
   }
 
