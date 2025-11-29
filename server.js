@@ -1910,11 +1910,12 @@ io.on('connection', (socket) => {
 
   // 🆕 ENHANCED: Initiate call with concurrent call prevention
   socket.on('initiate_call', async (data) => {
-    const { callerId, recipientId, callType = 'video', callId, roomName } = data;
+    const { callerId, recipientId, callType = 'video', callId, roomName, callerName: providedCallerName } = data;
 
     logger.info(`📞 === INITIATE_CALL EVENT RECEIVED ===`);
     logger.info(`📞 Data: ${JSON.stringify(data)}`);
     logger.info(`📞 Caller: ${callerId}, Recipient: ${recipientId}, Type: ${callType}`);
+    logger.info(`📞 Provided Caller Name: ${providedCallerName || 'NOT PROVIDED'}`);
 
     if (!callerId || !recipientId) {
       logger.error(`❌ Missing required fields - callerId: ${callerId}, recipientId: ${recipientId}`);
@@ -1950,17 +1951,28 @@ io.on('connection', (socket) => {
     // 🔧 NEW: Check if user has toggle ON in Firestore (even without WebSocket)
     let hasToggleOn = false;
     let hasFcmToken = false;
-    let callerName = 'Someone';
 
-    // Get caller name for notification
-    try {
-      const callerDoc = await scalability.firestore.collection('users').doc(callerId).get();
-      if (callerDoc.exists) {
-        callerName = callerDoc.data()?.name || 'Someone';
+    // 🔧 FIX: Get caller's display name - either from provided data or fetch from Firestore
+    let callerName = providedCallerName || null;
+    if (!callerName || callerName === 'Unknown' || callerName === callerId) {
+      try {
+        logger.info(`📞 Fetching caller name from Firestore for: ${callerId}`);
+        const callerDoc = await scalability.firestore.collection('users').doc(callerId).get();
+        if (callerDoc.exists) {
+          const callerData = callerDoc.data();
+          // Try multiple fields for the name
+          callerName = callerData.displayName || callerData.name || callerData.username || 'Someone';
+          logger.info(`📞 ✅ Fetched caller name: ${callerName}`);
+        } else {
+          callerName = 'Someone';
+          logger.warn(`📞 ⚠️ Caller document not found for: ${callerId}`);
+        }
+      } catch (e) {
+        logger.warn(`⚠️ Could not get caller name: ${e.message}`);
+        callerName = 'Someone';
       }
-    } catch (e) {
-      logger.warn(`⚠️ Could not get caller name: ${e.message}`);
     }
+    logger.info(`📞 Final caller name for notification: ${callerName}`);
 
     // If no WebSocket connection, check Firestore for availability preference
     if (!hasConnection) {
@@ -2011,6 +2023,7 @@ io.on('connection', (socket) => {
       callId: finalCallId,
       roomName: finalRoomName,
       callerId,
+      callerName,  // 🔧 FIX: Include caller name in call object
       recipientId,
       callType,
       status: 'initiated',
@@ -2051,15 +2064,17 @@ io.on('connection', (socket) => {
         callId: finalCallId,
         roomName: finalRoomName,
         callerId: callerId,
+        callerName: callerName,  // 🔧 FIX: Include caller name
         recipientId: recipientId,
         callType: callType,
         timestamp: new Date().toISOString(),
-        // Additional fields for Flutter app
-        caller_id: callerId,  // Alternative format
-        recipient_id: recipientId,  // Alternative format
-        room_name: finalRoomName,  // Alternative format
-        call_type: callType,  // Alternative format
-        call_id: finalCallId  // Alternative format
+        // Additional fields for Flutter app (snake_case format)
+        caller_id: callerId,
+        caller_name: callerName,  // 🔧 FIX: Include caller name (snake_case)
+        recipient_id: recipientId,
+        room_name: finalRoomName,
+        call_type: callType,
+        call_id: finalCallId
       };
       
       logger.info(`📞 Incoming call payload: ${JSON.stringify(incomingCallPayload)}`);
