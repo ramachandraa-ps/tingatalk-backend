@@ -2126,7 +2126,7 @@ io.on('connection', (socket) => {
   });
 
   // 🆕 ENHANCED: Handle disconnection with call cleanup
-  socket.on('disconnect', (reason) => {
+  socket.on('disconnect', async (reason) => {
     logger.info(`🔌 User disconnected: ${socket.id} - Reason: ${reason}`);
     
     // 🆕 Find user and update status
@@ -2191,10 +2191,12 @@ io.on('connection', (socket) => {
 
         const userType = user.userType || 'unknown';
 
-        // 🔧 IMMEDIATE: Emit user_disconnected event RIGHT AWAY for female users
-        // This allows male's Browse Dates to remove the card INSTANTLY
+        // 🔧 IMMEDIATE: For female users, update Firestore AND emit event RIGHT AWAY
+        // This ensures card disappears INSTANTLY and doesn't reappear when they reconnect
         if (userType === 'female') {
-          logger.info(`📢 Emitting IMMEDIATE user_disconnected for female user ${userId}`);
+          logger.info(`📢 Female user ${userId} disconnected - IMMEDIATE update`);
+
+          // 1. Emit event to connected males for instant UI update
           io.emit('user_disconnected', {
             disconnectedUserId: userId,
             userId: userId,
@@ -2202,11 +2204,37 @@ io.on('connection', (socket) => {
             timestamp: new Date().toISOString(),
             reason: 'websocket_disconnect'
           });
+
+          // 2. IMMEDIATELY update Firestore isAvailable to false
+          // This is CRITICAL: when female reopens app, she should NOT appear until toggle is turned ON
+          try {
+            const db = scalability.firestore;
+            if (db) {
+              await db.collection('users').doc(userId).update({
+                isAvailable: false,
+                isOnline: false,
+                lastSeenAt: new Date(),
+                disconnectedAt: new Date(),
+                unavailableReason: 'app_closed'
+              });
+              logger.info(`✅ Female user ${userId} - isAvailable set to FALSE in Firestore IMMEDIATELY`);
+
+              // Also emit availability_changed for any other listeners
+              io.emit('availability_changed', {
+                femaleUserId: userId,
+                isAvailable: false,
+                status: 'unavailable',
+                reason: 'disconnect',
+                timestamp: new Date().toISOString()
+              });
+            }
+          } catch (firestoreError) {
+            logger.error(`❌ Failed to update Firestore for female ${userId} on disconnect:`, firestoreError.message);
+          }
         }
 
-        // 🆕 START DISCONNECT TIMEOUT
-        // After 30 seconds of disconnect, mark user as unavailable in Firestore
-        // This handles the case when user force-closes the app
+        // 🆕 START DISCONNECT TIMEOUT (backup mechanism)
+        // After 30 seconds of disconnect, also mark in Firestore (in case immediate update failed)
         startDisconnectTimeout(userId, userType);
 
         logger.info(`👤 User ${userId} (${userType}) disconnected - Started ${DISCONNECT_TIMEOUT_MS / 1000}s timeout`);
