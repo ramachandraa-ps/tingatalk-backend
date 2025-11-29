@@ -2189,10 +2189,24 @@ io.on('connection', (socket) => {
           lastStatusChange: new Date()
         });
 
+        const userType = user.userType || 'unknown';
+
+        // 🔧 IMMEDIATE: Emit user_disconnected event RIGHT AWAY for female users
+        // This allows male's Browse Dates to remove the card INSTANTLY
+        if (userType === 'female') {
+          logger.info(`📢 Emitting IMMEDIATE user_disconnected for female user ${userId}`);
+          io.emit('user_disconnected', {
+            disconnectedUserId: userId,
+            userId: userId,
+            userType: 'female',
+            timestamp: new Date().toISOString(),
+            reason: 'websocket_disconnect'
+          });
+        }
+
         // 🆕 START DISCONNECT TIMEOUT
         // After 30 seconds of disconnect, mark user as unavailable in Firestore
         // This handles the case when user force-closes the app
-        const userType = user.userType || 'unknown';
         startDisconnectTimeout(userId, userType);
 
         logger.info(`👤 User ${userId} (${userType}) disconnected - Started ${DISCONNECT_TIMEOUT_MS / 1000}s timeout`);
