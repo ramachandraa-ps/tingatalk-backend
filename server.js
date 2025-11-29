@@ -825,6 +825,108 @@ app.post('/api/check_availability', async (req, res) => {
   }
 });
 
+// 🆕 PRODUCTION ENDPOINT: Check if a call is still active/valid
+// Used by mobile app to validate call before showing ringer screen
+app.post('/api/check_call_status', async (req, res) => {
+  try {
+    const { call_id, caller_id, recipient_id } = req.body;
+
+    if (!call_id) {
+      return res.status(400).json({ error: 'Missing call_id' });
+    }
+
+    logger.info(`📞 Checking call status for call_id: ${call_id}`);
+
+    // Check if call exists in active calls (in-memory)
+    const activeCall = activeCalls.get(call_id);
+
+    if (activeCall) {
+      // Call is active in memory
+      const callStatus = activeCall.status || 'unknown';
+      const isRinging = callStatus === 'ringing' || callStatus === 'initiated';
+      const isConnected = callStatus === 'connected' || callStatus === 'answered';
+
+      logger.info(`✅ Call ${call_id} found in activeCalls - Status: ${callStatus}`);
+
+      return res.json({
+        success: true,
+        call_active: true,
+        call_status: callStatus,
+        is_ringing: isRinging,
+        is_connected: isConnected,
+        call_data: {
+          callId: activeCall.callId,
+          callerId: activeCall.callerId,
+          callerName: activeCall.callerName,
+          recipientId: activeCall.recipientId,
+          callType: activeCall.callType,
+          roomName: activeCall.roomName,
+          startedAt: activeCall.startedAt,
+        },
+        message: `Call is ${callStatus}`
+      });
+    }
+
+    // Call not in memory - check Firestore for call history
+    logger.info(`⚠️ Call ${call_id} not in activeCalls, checking Firestore...`);
+
+    const db = scalability.firestore;
+    if (db) {
+      const callDoc = await db.collection('calls').doc(call_id).get();
+
+      if (callDoc.exists) {
+        const callData = callDoc.data();
+        const callStatus = callData.status || 'unknown';
+        const isEnded = ['ended', 'declined', 'missed', 'cancelled', 'timeout', 'no_answer'].includes(callStatus);
+
+        logger.info(`📋 Call ${call_id} found in Firestore - Status: ${callStatus}, Ended: ${isEnded}`);
+
+        return res.json({
+          success: true,
+          call_active: !isEnded,
+          call_status: callStatus,
+          is_ringing: false,
+          is_connected: false,
+          is_ended: isEnded,
+          ended_reason: isEnded ? callStatus : null,
+          call_data: {
+            callId: callData.callId,
+            callerId: callData.callerId,
+            callerName: callData.callerName,
+            recipientId: callData.recipientId,
+            callType: callData.callType,
+            roomName: callData.roomName,
+            endedAt: callData.endedAt,
+            duration: callData.duration,
+          },
+          message: isEnded ? `Call has ended (${callStatus})` : `Call status: ${callStatus}`
+        });
+      }
+    }
+
+    // Call not found anywhere
+    logger.warn(`❌ Call ${call_id} not found in activeCalls or Firestore`);
+
+    return res.json({
+      success: true,
+      call_active: false,
+      call_status: 'not_found',
+      is_ringing: false,
+      is_connected: false,
+      is_ended: true,
+      ended_reason: 'not_found',
+      message: 'Call not found - may have ended or never existed'
+    });
+
+  } catch (error) {
+    logger.error('❌ Error in /api/check_call_status:', error);
+    res.status(500).json({
+      error: 'Failed to check call status',
+      details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
+  }
+});
+
 // 🆕 PRODUCTION ENDPOINT: Update user availability status (for female users)
 app.post('/api/update_availability', async (req, res) => {
   try {
