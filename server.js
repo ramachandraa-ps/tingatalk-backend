@@ -2116,10 +2116,14 @@ io.on('connection', (socket) => {
           io.to(recipientSocketId).emit('call_timeout', { callId: finalCallId });
           socket.emit('call_timeout', { callId: finalCallId, reason: 'No response from recipient' });
           
-          // Mark call as timed out and remove
+          // Mark call as timed out and remove - UPDATE FIRESTORE
           currentCall.status = 'timeout';
           currentCall.timeoutAt = new Date();
-          deleteActiveCallSync(finalCallId);
+          completeCallSync(finalCallId, {
+            status: 'timeout',
+            timeoutAt: new Date(),
+            endedAt: new Date(),
+          });
         }
       }, 30000); // 30 seconds
       
@@ -2171,10 +2175,14 @@ io.on('connection', (socket) => {
                 reason: 'No response from recipient (FCM)',
               });
 
-              // Mark call as timed out and remove
+              // Mark call as timed out and remove - UPDATE FIRESTORE
               currentCall.status = 'timeout';
               currentCall.timeoutAt = new Date();
-              deleteActiveCallSync(finalCallId);
+              completeCallSync(finalCallId, {
+                status: 'timeout',
+                timeoutAt: new Date(),
+                endedAt: new Date(),
+              });
             }
           }, 60000); // 60 seconds for FCM calls
 
@@ -2290,9 +2298,13 @@ io.on('connection', (socket) => {
       logger.warn(`⚠️  Caller ${callerId} not found in connected users`);
     }
 
-    // Remove call from active calls
-    deleteActiveCallSync(callId);
-    
+    // Remove call from active calls - UPDATE FIRESTORE
+    completeCallSync(callId, {
+      status: 'declined',
+      declinedAt: call.declinedAt,
+      endedAt: new Date(),
+    });
+
     logger.info(`❌ Call declined: ${callId} by ${recipientId} - Recipient status reset to available`);
   });
 
@@ -2340,10 +2352,103 @@ io.on('connection', (socket) => {
       });
     }
 
-    // Remove call from active calls
-    deleteActiveCallSync(callId);
+    // Remove call from active calls - UPDATE FIRESTORE
+    completeCallSync(callId, {
+      status: 'ended',
+      endedAt: call.endedAt,
+      endedBy: userId,
+    });
 
     logger.info(`📞 Call ended: ${callId} by ${userId} - All participants status reset to available`);
+  });
+
+  // 🆕 NEW: Handle cancel_call - when caller cancels before recipient answers
+  socket.on('cancel_call', async (data) => {
+    const { callId, callerId, recipientId, userId, reason } = data;
+
+    logger.info(`📞 ====== CANCEL_CALL EVENT ======`);
+    logger.info(`📞 Call ID: ${callId}`);
+    logger.info(`📞 Caller: ${callerId}, Recipient: ${recipientId}`);
+    logger.info(`📞 Cancelled by: ${userId}, Reason: ${reason}`);
+
+    const call = activeCalls.get(callId);
+
+    if (call) {
+      call.status = 'cancelled';
+      call.cancelledAt = new Date();
+      call.cancelledBy = userId;
+      call.cancelReason = reason;
+
+      logger.info(`📞 Found call in activeCalls, updating status to cancelled`);
+
+      // Reset recipient status to available
+      setUserStatusSync(recipientId, {
+        status: 'available',
+        currentCallId: null,
+        lastStatusChange: new Date()
+      });
+
+      // Notify recipient that call was cancelled
+      const recipient = connectedUsers.get(recipientId);
+      if (recipient) {
+        logger.info(`📞 Notifying recipient ${recipientId} that call was cancelled`);
+        io.to(recipient.socketId).emit('call_cancelled', {
+          callId,
+          cancelledBy: userId,
+          reason: reason || 'caller_cancelled',
+          cancelledAt: call.cancelledAt.toISOString()
+        });
+      }
+
+      // Also emit call_ended for compatibility
+      if (recipient) {
+        io.to(recipient.socketId).emit('call_ended', {
+          callId,
+          endedBy: userId,
+          reason: 'cancelled',
+          endedAt: call.cancelledAt.toISOString()
+        });
+      }
+
+      // Update Firestore and remove from active calls
+      completeCallSync(callId, {
+        status: 'cancelled',
+        cancelledAt: call.cancelledAt,
+        cancelledBy: userId,
+        cancelReason: reason,
+        endedAt: call.cancelledAt,
+      });
+
+      logger.info(`✅ Call ${callId} cancelled successfully - Firestore updated`);
+    } else {
+      logger.warn(`⚠️ Call ${callId} not found in activeCalls for cancel`);
+
+      // Even if not in memory, update Firestore
+      scalability.updateCallInFirestore(callId, {
+        status: 'cancelled',
+        cancelledAt: new Date(),
+        cancelledBy: userId,
+        cancelReason: reason,
+        endedAt: new Date(),
+      }).catch(err => {
+        logger.error(`Error updating cancelled call in Firestore: ${err.message}`);
+      });
+
+      // Still try to notify recipient
+      const recipient = connectedUsers.get(recipientId);
+      if (recipient) {
+        io.to(recipient.socketId).emit('call_cancelled', {
+          callId,
+          cancelledBy: userId,
+          reason: reason || 'caller_cancelled',
+        });
+        io.to(recipient.socketId).emit('call_ended', {
+          callId,
+          endedBy: userId,
+          reason: 'cancelled',
+        });
+      }
+    }
   });
 
   // 🆕 ENHANCED: Handle disconnection with call cleanup
