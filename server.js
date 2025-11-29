@@ -172,6 +172,11 @@ const userStatus = new Map(); // userId -> { status: 'available'|'unavailable'|'
 // 🆕 PRODUCTION FEATURE: Call timers for server-side duration tracking
 const callTimers = new Map(); // callId -> { interval, startTime, durationSeconds }
 
+// 🆕 DISCONNECT TIMEOUT: Auto-mark users unavailable after disconnect
+// When user disconnects, start a timer. If they don't reconnect within timeout, set isAvailable=false
+const disconnectTimeouts = new Map(); // userId -> { timeoutId, disconnectedAt, userType }
+const DISCONNECT_TIMEOUT_MS = 30000; // 30 seconds timeout before marking unavailable
+
 // ============================================================================
 // 🆕 REDIS + FIRESTORE WRAPPERS (Non-blocking, Cluster-Safe)
 // ============================================================================
@@ -203,6 +208,75 @@ function deleteUserStatusSync(userId) {
   scalability.deleteUserStatus(userId).catch(err =>
     logger.error(`Error deleting user status from Redis: ${err.message}`)
   );
+}
+
+// 🆕 DISCONNECT TIMEOUT HELPER FUNCTIONS
+// Start disconnect timeout - will mark user unavailable after DISCONNECT_TIMEOUT_MS
+function startDisconnectTimeout(userId, userType) {
+  // Cancel any existing timeout for this user
+  cancelDisconnectTimeout(userId);
+
+  logger.info(`⏱️ Starting disconnect timeout for user ${userId} (${userType || 'unknown'}) - ${DISCONNECT_TIMEOUT_MS / 1000}s`);
+
+  const timeoutId = setTimeout(async () => {
+    logger.warn(`⏱️ Disconnect timeout expired for user ${userId} - Marking as unavailable in Firestore`);
+
+    try {
+      // Check if user has reconnected (if they have, the timeout would have been cancelled)
+      const userConnection = connectedUsers.get(userId);
+      if (userConnection && userConnection.isOnline) {
+        logger.info(`✅ User ${userId} has reconnected - NOT marking as unavailable`);
+        disconnectTimeouts.delete(userId);
+        return;
+      }
+
+      // Update Firestore to mark user as unavailable
+      const db = scalability.firestore;
+      if (db) {
+        await db.collection('users').doc(userId).update({
+          isAvailable: false,
+          isOnline: false,
+          lastSeenAt: new Date(),
+          unavailableReason: 'disconnect_timeout',
+          disconnectedAt: new Date(),
+        });
+        logger.info(`✅ User ${userId} marked as unavailable in Firestore (disconnect timeout)`);
+
+        // Also emit event to notify any connected clients about availability change
+        io.emit('availability_changed', {
+          femaleUserId: userId,
+          isAvailable: false,
+          status: 'unavailable',
+          reason: 'disconnect_timeout',
+          timestamp: new Date().toISOString(),
+        });
+      } else {
+        logger.error(`❌ Firestore not available - cannot update user ${userId}`);
+      }
+    } catch (error) {
+      logger.error(`❌ Error updating Firestore for user ${userId} disconnect timeout:`, error.message);
+    }
+
+    // Clean up the timeout entry
+    disconnectTimeouts.delete(userId);
+  }, DISCONNECT_TIMEOUT_MS);
+
+  // Store the timeout info
+  disconnectTimeouts.set(userId, {
+    timeoutId,
+    disconnectedAt: new Date(),
+    userType: userType || 'unknown',
+  });
+}
+
+// Cancel disconnect timeout (called when user reconnects)
+function cancelDisconnectTimeout(userId) {
+  const existingTimeout = disconnectTimeouts.get(userId);
+  if (existingTimeout) {
+    clearTimeout(existingTimeout.timeoutId);
+    disconnectTimeouts.delete(userId);
+    logger.info(`✅ Cancelled disconnect timeout for user ${userId} (reconnected)`);
+  }
 }
 
 function setActiveCallSync(callId, callData) {
@@ -923,32 +997,19 @@ app.get('/api/get_available_females', async (req, res) => {
         logger.info(`📋   - Socket connected: ${isSocketConnected}`);
       }
 
-      // 🆕 Check if user has FCM token (can receive push notifications)
-      const hasFcmToken = !!(userData.fcmToken && userData.fcmToken.length > 0);
-      logger.info(`📋   - Has FCM token: ${hasFcmToken}`);
-
-      // 🆕 REACHABILITY LOGIC:
-      // - 'websocket': Active WebSocket connection (app in foreground)
-      // - 'fcm': Has FCM token, no WebSocket (app in background)
-      // - 'offline': No WebSocket, no FCM token (completely offline)
-      let reachability = 'offline';
-      if (isSocketConnected) {
-        reachability = 'websocket';
-      } else if (hasFcmToken) {
-        reachability = 'fcm';
+      // 🔧 RESTORED ORIGINAL LOGIC: ONLY show users with active WebSocket connection
+      // User MUST have active WebSocket to appear in browse list
+      // If app is closed (even with toggle ON), user should NOT appear
+      if (!isSocketConnected) {
+        logger.info(`📋 Skipping user ${userId} (${userData.name}) - no active WebSocket connection`);
+        continue;
       }
 
-      logger.info(`📋   - Reachability: ${reachability}`);
+      logger.info(`📋   - User has active WebSocket connection - AVAILABLE`);
 
-      // 🆕 CRITICAL FIX: Include users who are reachable via WebSocket OR FCM
-      // Firestore isAvailable=true means user has toggle ON (wants to receive calls)
-      // They should appear in browse list if reachable by any method
-      const isReachable = reachability !== 'offline';
-
-      logger.info(`📋   - Final availability decision: ${isReachable ? 'REACHABLE' : 'NOT REACHABLE'}`);
-
-      if (!isReachable) {
-        logger.info(`📋 Skipping user ${userId} (${userData.name}) - not reachable (no WebSocket and no FCM token)`);
+      // Also verify isAvailable is true in Firestore (toggle is ON)
+      if (userData.isAvailable !== true) {
+        logger.info(`📋 Skipping user ${userId} (${userData.name}) - isAvailable is not true`);
         continue;
       }
 
@@ -1029,16 +1090,15 @@ app.get('/api/get_available_females', async (req, res) => {
       }
 
       // STEP 4: Build user object with all required fields
-      // 🆕 ENHANCED: Include reachability status for UI indicators
+      // 🔧 RESTORED: Only WebSocket-connected users reach this point
       const userObject = {
         userId: userId,
         name: userData.name || 'Unknown',
         age: userData.age || 0,
         photoUrl: userData.photoUrl || '',
         fullPhotoUrl: userData.fullPhotoUrl || userData.photoUrl || '',
-        isOnline: reachability === 'websocket', // True only if WebSocket connected
-        isAvailable: true, // Always true since we filtered by Firestore isAvailable
-        reachability: reachability, // 'websocket', 'fcm', or 'offline'
+        isOnline: true, // Always true - only WebSocket-connected users reach here
+        isAvailable: true, // Always true - filtered by Firestore isAvailable earlier
         rating: powerUpStats.rating,
         totalCalls: powerUpStats.totalCalls,
         totalLikes: powerUpStats.totalLikes,
@@ -1645,6 +1705,10 @@ io.on('connection', (socket) => {
 
     logger.info(`🚪 Processing join for user: ${userId}`);
 
+    // 🆕 CANCEL DISCONNECT TIMEOUT if user is reconnecting
+    // This prevents the user from being marked as unavailable if they reconnect within timeout
+    cancelDisconnectTimeout(userId);
+
     // 🔧 FIX: Check if user already has an active connection
     const existingUser = connectedUsers.get(userId);
     if (existingUser && existingUser.socketId !== socket.id) {
@@ -1706,16 +1770,31 @@ io.on('connection', (socket) => {
     
     const userStatusObj = userStatus.get(userId);
     logger.info(`👤 User ${userId} (${userType || 'unknown'}) joined - Socket: ${socket.id} - Status: ${userStatusObj.status}`);
-    
-    const joinResponse = { 
-      userId, 
+
+    // 🆕 UPDATE FIRESTORE: Mark user as online when they connect
+    try {
+      const db = scalability.firestore;
+      if (db) {
+        await db.collection('users').doc(userId).update({
+          isOnline: true,
+          lastSeenAt: new Date(),
+          lastConnectedAt: new Date(),
+        });
+        logger.info(`✅ User ${userId} marked as online in Firestore`);
+      }
+    } catch (firestoreError) {
+      logger.warn(`⚠️ Could not update online status in Firestore: ${firestoreError.message}`);
+    }
+
+    const joinResponse = {
+      userId,
       userType: userType || 'unknown',
       status: userStatusObj.status,
       socketId: socket.id,
       roomName: roomName,
       success: true
     };
-    
+
     logger.info(`🚪 Sending 'joined' confirmation: ${JSON.stringify(joinResponse)}`);
     socket.emit('joined', joinResponse);
     logger.info(`🚪 === JOIN PROCESSING COMPLETE ===`);
@@ -2103,14 +2182,20 @@ io.on('connection', (socket) => {
           }
         }
         
-        // 🆕 Update user status to unavailable (no connection = can't receive calls)
+        // 🆕 Update user status to disconnected (no connection = can't receive calls via WebSocket)
         setUserStatusSync(userId, {
-          status: 'unavailable',
+          status: 'disconnected',
           currentCallId: null,
           lastStatusChange: new Date()
         });
 
-        logger.info(`👤 User ${userId} disconnected - Status updated to unavailable`);
+        // 🆕 START DISCONNECT TIMEOUT
+        // After 30 seconds of disconnect, mark user as unavailable in Firestore
+        // This handles the case when user force-closes the app
+        const userType = user.userType || 'unknown';
+        startDisconnectTimeout(userId, userType);
+
+        logger.info(`👤 User ${userId} (${userType}) disconnected - Started ${DISCONNECT_TIMEOUT_MS / 1000}s timeout`);
         break;
       }
     }
