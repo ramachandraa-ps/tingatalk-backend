@@ -841,19 +841,24 @@ app.post('/api/check_call_status', async (req, res) => {
     const activeCall = activeCalls.get(call_id);
 
     if (activeCall) {
-      // Call is active in memory
+      // Call is in memory - check if it's actually active or already ended
       const callStatus = activeCall.status || 'unknown';
       const isRinging = callStatus === 'ringing' || callStatus === 'initiated';
       const isConnected = callStatus === 'connected' || callStatus === 'answered';
+      // 🔧 FIX: Check if call is ended/cancelled even if still in memory
+      const isEnded = ['ended', 'declined', 'missed', 'cancelled', 'timeout', 'no_answer'].includes(callStatus);
+      const isActive = !isEnded && (isRinging || isConnected || callStatus === 'unknown');
 
-      logger.info(`✅ Call ${call_id} found in activeCalls - Status: ${callStatus}`);
+      logger.info(`✅ Call ${call_id} found in activeCalls - Status: ${callStatus}, Active: ${isActive}`);
 
       return res.json({
         success: true,
-        call_active: true,
+        call_active: isActive,
         call_status: callStatus,
         is_ringing: isRinging,
         is_connected: isConnected,
+        is_ended: isEnded,
+        ended_reason: isEnded ? callStatus : null,
         call_data: {
           callId: activeCall.callId,
           callerId: activeCall.callerId,
@@ -863,7 +868,7 @@ app.post('/api/check_call_status', async (req, res) => {
           roomName: activeCall.roomName,
           startedAt: activeCall.startedAt,
         },
-        message: `Call is ${callStatus}`
+        message: isEnded ? `Call has ended (${callStatus})` : `Call is ${callStatus}`
       });
     }
 
