@@ -120,10 +120,19 @@ const corsOptions = {
   optionsSuccessStatus: 200
 };
 
-// Socket.IO configuration
+// Socket.IO configuration with keepalive settings
+// 🆕 ISSUE #14 FIX: Added pingTimeout and pingInterval to prevent premature disconnections
+// - pingInterval: How often server sends ping to client (25 seconds)
+// - pingTimeout: How long server waits for pong before disconnecting (60 seconds)
+// Total time before disconnect = pingInterval + pingTimeout = 85 seconds
+// This accommodates mobile networks with variable latency
 const io = socketIo(server, {
   cors: corsOptions,
-  transports: ['websocket', 'polling']
+  transports: ['websocket', 'polling'],
+  pingInterval: 25000,    // Send ping every 25 seconds
+  pingTimeout: 60000,     // Wait 60 seconds for pong response
+  connectTimeout: 45000,  // 45 seconds to establish connection
+  upgradeTimeout: 30000,  // 30 seconds to upgrade from polling to websocket
 });
 
 // Setup Socket.IO Redis Adapter for clustering
