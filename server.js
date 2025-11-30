@@ -2355,6 +2355,23 @@ io.on('connection', (socket) => {
     });
   });
 
+  // 🆕 ISSUE #17 FIX: Handle health check ping from Flutter
+  // This is used by the WebSocketService health check system to verify connection is alive
+  socket.on('health_ping', (data) => {
+    const { userId, timestamp } = data;
+
+    // Lightweight acknowledgment - just proves the socket is alive
+    logger.debug(`📡 Health ping received from user: ${userId}`);
+
+    // Send pong back so Flutter knows the connection is truly alive
+    socket.emit('health_pong', {
+      userId,
+      serverTime: Date.now(),
+      clientTime: timestamp,
+      status: 'alive',
+    });
+  });
+
   // 🆕 ENHANCED: End call with status cleanup and timer stop
   socket.on('end_call', async (data) => {
     const { callId, userId } = data;
