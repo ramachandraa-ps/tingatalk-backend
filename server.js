@@ -2337,6 +2337,24 @@ io.on('connection', (socket) => {
     logger.info(`❌ Call declined: ${callId} by ${recipientId} - Recipient status reset to available`);
   });
 
+  // 🆕 ISSUE #16 FIX: Handle WebSocket keepalive ping from Flutter during calls
+  // This keeps the Socket.IO connection alive on mobile networks
+  socket.on('call_ping', (data) => {
+    const { callId, userId, timestamp } = data;
+
+    // Just acknowledge the ping - no heavy processing needed
+    // The fact that the message was received keeps the connection alive
+    logger.debug(`📡 Call ping received: callId=${callId}, userId=${userId}`);
+
+    // Optionally send pong back (Flutter doesn't need it, but useful for debugging)
+    socket.emit('call_pong', {
+      callId,
+      userId,
+      serverTime: Date.now(),
+      clientTime: timestamp,
+    });
+  });
+
   // 🆕 ENHANCED: End call with status cleanup and timer stop
   socket.on('end_call', async (data) => {
     const { callId, userId } = data;
