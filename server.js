@@ -1723,10 +1723,12 @@ app.post('/api/calls/complete', async (req, res) => {
 // Heartbeat - Keep call alive
 app.post('/api/calls/heartbeat', async (req, res) => {
   try {
-    const { callId, callerId } = req.body;
-    
-    if (!callId || !callerId) {
-      return res.status(400).json({ error: 'Missing required fields: callId, callerId' });
+    // 🆕 ISSUE #13 FIX: Accept both userId and callerId for backwards compatibility
+    const { callId, userId, callerId } = req.body;
+    const effectiveUserId = userId || callerId; // Prefer userId, fallback to callerId
+
+    if (!callId || !effectiveUserId) {
+      return res.status(400).json({ error: 'Missing required fields: callId, userId (or callerId)' });
     }
     
     const serverTimer = callTimers.get(callId);
