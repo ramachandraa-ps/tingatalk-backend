@@ -2522,17 +2522,56 @@ io.on('connection', (socket) => {
               });
             }
             
-            // Clean up call
-            call.status = 'disconnected';
-            call.disconnectedAt = new Date();
-            deleteActiveCallSync(callId);
-            
-            // Stop server timer if exists
+            // 🆕 ISSUE #15 FIX: Properly complete call with billing on disconnect
+            // This ensures call logs are updated in Firestore with duration and cost
             const serverTimer = callTimers.get(callId);
+
             if (serverTimer) {
+              // Stop the timer first
               clearInterval(serverTimer.interval);
+              const durationSeconds = serverTimer.durationSeconds || 0;
+              const coinRate = serverTimer.coinRate || COIN_RATES.audio;
+              const coinsDeducted = Math.ceil(durationSeconds * coinRate);
+
+              logger.info(`⏱️ Call ${callId} disconnected - Duration: ${durationSeconds}s, Cost: ${coinsDeducted} coins`);
+
+              // Deduct coins from caller (non-blocking)
+              if (call.callerId && coinsDeducted > 0) {
+                scalability.deductUserCoins(call.callerId, coinsDeducted, callId)
+                  .then(() => logger.info(`💰 Deducted ${coinsDeducted} coins from ${call.callerId} for disconnected call`))
+                  .catch(err => logger.error(`❌ Failed to deduct coins on disconnect: ${err.message}`));
+              }
+
+              // Update Firestore with complete call details
+              completeCallSync(callId, {
+                status: 'disconnected',
+                endReason: 'connection_lost',
+                disconnectedBy: userId,
+                disconnectedAt: new Date().toISOString(),
+                endedAt: new Date().toISOString(),
+                durationSeconds: durationSeconds,
+                coinsDeducted: coinsDeducted,
+                coinRate: coinRate,
+              });
+
               callTimers.delete(callId);
-              logger.info(`⏱️  Stopped server timer for call ${callId} due to disconnect`);
+              logger.info(`✅ Call ${callId} completed on disconnect - Firestore updated`);
+            } else {
+              // No timer means call wasn't fully connected, just mark as disconnected
+              call.status = 'disconnected';
+              call.disconnectedAt = new Date();
+
+              completeCallSync(callId, {
+                status: 'disconnected',
+                endReason: 'connection_lost_before_connect',
+                disconnectedBy: userId,
+                disconnectedAt: new Date().toISOString(),
+                endedAt: new Date().toISOString(),
+                durationSeconds: 0,
+                coinsDeducted: 0,
+              });
+
+              logger.info(`⏱️ Call ${callId} marked disconnected (no timer) - Firestore updated`);
             }
           }
         }
