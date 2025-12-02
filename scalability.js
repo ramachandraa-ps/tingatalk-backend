@@ -454,7 +454,7 @@ class ScalabilityManager {
 
     try {
       const callRef = this.firestore.collection('calls').doc(callId);
-      
+
       const updateData = {
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       };
@@ -466,9 +466,12 @@ class ScalabilityManager {
       if (updates.serverDurationSeconds !== undefined) updateData.serverDurationSeconds = updates.serverDurationSeconds;
       if (updates.clientDurationSeconds !== undefined) updateData.clientDurationSeconds = updates.clientDurationSeconds;
       if (updates.isFraudulent !== undefined) updateData.isFraudulent = updates.isFraudulent;
-      
+      // PHASE 1 FIX: Support endReason and autoCompleted fields
+      if (updates.endReason !== undefined) updateData.endReason = updates.endReason;
+      if (updates.autoCompleted !== undefined) updateData.autoCompleted = updates.autoCompleted;
+
       await callRef.update(updateData);
-      
+
       this.logger.debug(`💾 Call ${callId} updated in Firestore`);
       return true;
     } catch (error) {

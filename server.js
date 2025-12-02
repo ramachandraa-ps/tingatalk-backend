@@ -508,12 +508,125 @@ setTimeout(async () => {
 const STALE_TIMER_THRESHOLD_MS = config.cleanup.staleTimerThreshold; // From config (default: 1 hour)
 const CLEANUP_INTERVAL_MS = config.cleanup.cleanupInterval; // From config (default: 1 minute)
 
-setInterval(() => {
+// ============================================================================
+// PHASE 1 FIX: Auto-complete calls when heartbeat is missing
+// If no heartbeat received for 60 seconds, auto-complete the call
+// This fixes the issue where calls stay "active" when client crashes
+// ============================================================================
+const HEARTBEAT_TIMEOUT_MS = 60000; // 60 seconds - if no heartbeat, auto-complete call
+
+/**
+ * Auto-complete a call that has timed out due to missing heartbeat
+ * This handles the case when client crashes/disconnects without calling /api/calls/complete
+ */
+async function autoCompleteTimedOutCall(callId, timer) {
+  try {
+    logger.warn(`⏰ Auto-completing timed out call: ${callId} (no heartbeat for 60s)`);
+
+    // Stop the timer interval
+    clearInterval(timer.interval);
+
+    const serverDuration = timer.durationSeconds;
+    const coinsDeducted = Math.ceil(serverDuration * timer.coinRate);
+
+    logger.info(`   Auto-complete - Duration: ${serverDuration}s, Coins: ${coinsDeducted}`);
+
+    // Deduct coins from caller
+    if (timer.callerId && coinsDeducted > 0) {
+      const deductResult = await scalability.deductUserCoins(timer.callerId, coinsDeducted, callId);
+      if (deductResult.success) {
+        logger.info(`   ✅ Deducted ${coinsDeducted} coins from ${timer.callerId}`);
+      } else {
+        logger.warn(`   ⚠️ Failed to deduct coins: ${deductResult.error}`);
+      }
+    }
+
+    // Update Firestore call record
+    await scalability.updateCallInFirestore(callId, {
+      status: 'completed',
+      durationSeconds: serverDuration,
+      coinsDeducted,
+      endedAt: new Date().toISOString(),
+      endReason: 'heartbeat_timeout',
+      autoCompleted: true
+    });
+
+    // Update user statuses back to available
+    if (timer.callerId) {
+      setUserStatusSync(timer.callerId, {
+        status: 'available',
+        currentCallId: null,
+        lastStatusChange: new Date()
+      });
+    }
+    if (timer.recipientId) {
+      setUserStatusSync(timer.recipientId, {
+        status: 'available',
+        currentCallId: null,
+        lastStatusChange: new Date()
+      });
+    }
+
+    // Notify both users via Socket.IO that call has ended
+    if (timer.callerId) {
+      const callerConnection = connectedUsers.get(timer.callerId);
+      if (callerConnection && callerConnection.socketId) {
+        io.to(callerConnection.socketId).emit('call_auto_ended', {
+          callId,
+          reason: 'heartbeat_timeout',
+          duration: serverDuration,
+          coinsDeducted
+        });
+      }
+    }
+    if (timer.recipientId) {
+      const recipientConnection = connectedUsers.get(timer.recipientId);
+      if (recipientConnection && recipientConnection.socketId) {
+        io.to(recipientConnection.socketId).emit('call_auto_ended', {
+          callId,
+          reason: 'heartbeat_timeout',
+          duration: serverDuration,
+          coinsDeducted: 0 // Recipient doesn't pay
+        });
+      }
+    }
+
+    // Clean up
+    callTimers.delete(callId);
+    await scalability.deleteCallTimer(callId);
+
+    logger.info(`   ✅ Call ${callId} auto-completed successfully`);
+    return true;
+
+  } catch (error) {
+    logger.error(`   ❌ Error auto-completing call ${callId}: ${error.message}`);
+    // Still clean up the timer to prevent infinite loop
+    callTimers.delete(callId);
+    return false;
+  }
+}
+
+// Periodic job: Check for stale timers AND missing heartbeats
+setInterval(async () => {
   const now = Date.now();
   let cleanedCount = 0;
+  let autoCompletedCount = 0;
 
   for (const [callId, timer] of callTimers.entries()) {
     const timerAge = now - timer.startTime;
+    const timeSinceHeartbeat = now - (timer.lastHeartbeat || timer.startTime);
+
+    // PHASE 1 FIX: Check for missing heartbeat (60 seconds)
+    if (timeSinceHeartbeat > HEARTBEAT_TIMEOUT_MS) {
+      logger.warn(`⏰ Call ${callId} has no heartbeat for ${Math.floor(timeSinceHeartbeat/1000)}s - auto-completing`);
+      const success = await autoCompleteTimedOutCall(callId, timer);
+      if (success) {
+        autoCompletedCount++;
+      }
+      continue; // Skip stale timer check since we already handled this call
+    }
+
+    // Original check: Clean up very old timers (1 hour)
     if (timerAge > STALE_TIMER_THRESHOLD_MS) {
       clearInterval(timer.interval);
       callTimers.delete(callId);
@@ -527,12 +640,16 @@ setInterval(() => {
     }
   }
 
+  if (autoCompletedCount > 0) {
+    logger.info(`⏰ Heartbeat timeout: auto-completed ${autoCompletedCount} calls`);
+  }
   if (cleanedCount > 0) {
     logger.info(`🧹 Periodic cleanup: removed ${cleanedCount} stale call timers`);
   }
 }, CLEANUP_INTERVAL_MS);
 
-logger.info(`✅ Periodic stale timer cleanup job initialized (runs every ${CLEANUP_INTERVAL_MS/1000}s)`);
+logger.info(`✅ Periodic cleanup job initialized (runs every ${CLEANUP_INTERVAL_MS/1000}s)`);
+logger.info(`⏰ Heartbeat timeout: calls will auto-complete after ${HEARTBEAT_TIMEOUT_MS/1000}s without heartbeat`);
 
 // Generate Twilio Access Token - Enhanced Security
 function generateSecureAccessToken(identity, roomName, isVideo = true) {
