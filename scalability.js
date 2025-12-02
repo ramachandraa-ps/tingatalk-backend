@@ -232,6 +232,185 @@ class ScalabilityManager {
   }
 
   // ============================================================================
+  // SOLUTION #3: Redis-based Distributed Locking for Call Initiation
+  // Prevents race conditions when multiple calls target same recipient
+  // ============================================================================
+
+  /**
+   * Acquire a lock for calling a specific recipient
+   * @param {string} recipientId - The user being called
+   * @param {string} callerId - The user making the call
+   * @param {number} ttlSeconds - Lock expiry time (default 30s)
+   * @returns {boolean} - True if lock acquired, false if recipient is already being called
+   */
+  async acquireCallLock(recipientId, callerId, ttlSeconds = 30) {
+    try {
+      const lockKey = `call_lock:${recipientId}`;
+      // NX = only set if not exists, EX = expiry in seconds
+      const result = await this.redis.set(lockKey, callerId, 'NX', 'EX', ttlSeconds);
+      if (result === 'OK') {
+        this.logger.info(`🔒 Call lock acquired for recipient ${recipientId} by caller ${callerId}`);
+        return true;
+      } else {
+        // Check who holds the lock
+        const currentHolder = await this.redis.get(lockKey);
+        this.logger.warn(`🔒 Call lock DENIED for ${recipientId} - already locked by ${currentHolder}`);
+        return false;
+      }
+    } catch (error) {
+      this.logger.error(`❌ Error acquiring call lock: ${error.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Release the call lock for a recipient
+   * @param {string} recipientId - The user who was being called
+   * @param {string} callerId - The caller who holds the lock (for verification)
+   */
+  async releaseCallLock(recipientId, callerId) {
+    try {
+      const lockKey = `call_lock:${recipientId}`;
+      // Only release if we own the lock
+      const currentHolder = await this.redis.get(lockKey);
+      if (currentHolder === callerId) {
+        await this.redis.del(lockKey);
+        this.logger.info(`🔓 Call lock released for recipient ${recipientId}`);
+        return true;
+      } else {
+        this.logger.warn(`⚠️ Cannot release lock for ${recipientId} - not owned by ${callerId}`);
+        return false;
+      }
+    } catch (error) {
+      this.logger.error(`❌ Error releasing call lock: ${error.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Check if a recipient is currently locked (being called)
+   * @param {string} recipientId - The user to check
+   * @returns {string|null} - Caller ID if locked, null if not
+   */
+  async getCallLockHolder(recipientId) {
+    try {
+      const lockKey = `call_lock:${recipientId}`;
+      return await this.redis.get(lockKey);
+    } catch (error) {
+      this.logger.error(`❌ Error checking call lock: ${error.message}`);
+      return null;
+    }
+  }
+
+  // ============================================================================
+  // SOLUTION #8: Persist Call Timers to Redis (survive server crash)
+  // ============================================================================
+
+  /**
+   * Save call timer state to Redis
+   * @param {string} callId - Call identifier
+   * @param {object} timerData - Timer data (startTime, callerId, recipientId, callType, coinRate)
+   */
+  async saveCallTimer(callId, timerData) {
+    try {
+      const timerKey = `call_timer:${callId}`;
+      await this.redis.hset(timerKey, {
+        startTime: timerData.startTime.toString(),
+        callerId: timerData.callerId,
+        recipientId: timerData.recipientId,
+        callType: timerData.callType || 'audio',
+        coinRate: timerData.coinRate.toString(),
+        durationSeconds: (timerData.durationSeconds || 0).toString()
+      });
+      // Auto-expire after 4 hours (14400 seconds)
+      await this.redis.expire(timerKey, 14400);
+      this.logger.debug(`💾 Call timer saved to Redis: ${callId}`);
+      return true;
+    } catch (error) {
+      this.logger.error(`❌ Error saving call timer to Redis: ${error.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Get call timer from Redis
+   * @param {string} callId - Call identifier
+   */
+  async getCallTimer(callId) {
+    try {
+      const timerKey = `call_timer:${callId}`;
+      const data = await this.redis.hgetall(timerKey);
+      if (!data || Object.keys(data).length === 0) {
+        return null;
+      }
+      return {
+        startTime: parseInt(data.startTime),
+        callerId: data.callerId,
+        recipientId: data.recipientId,
+        callType: data.callType,
+        coinRate: parseFloat(data.coinRate),
+        durationSeconds: parseInt(data.durationSeconds) || 0
+      };
+    } catch (error) {
+      this.logger.error(`❌ Error getting call timer from Redis: ${error.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Update call timer duration in Redis
+   * @param {string} callId - Call identifier
+   * @param {number} durationSeconds - Current duration
+   */
+  async updateCallTimerDuration(callId, durationSeconds) {
+    try {
+      const timerKey = `call_timer:${callId}`;
+      await this.redis.hset(timerKey, 'durationSeconds', durationSeconds.toString());
+      return true;
+    } catch (error) {
+      this.logger.error(`❌ Error updating call timer duration: ${error.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Delete call timer from Redis
+   * @param {string} callId - Call identifier
+   */
+  async deleteCallTimer(callId) {
+    try {
+      const timerKey = `call_timer:${callId}`;
+      await this.redis.del(timerKey);
+      this.logger.debug(`🗑️ Call timer deleted from Redis: ${callId}`);
+      return true;
+    } catch (error) {
+      this.logger.error(`❌ Error deleting call timer from Redis: ${error.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Get all active call timers from Redis (for recovery after crash)
+   */
+  async getAllCallTimers() {
+    try {
+      const keys = await this.redis.keys('call_timer:*');
+      const timers = {};
+      for (const key of keys) {
+        const callId = key.replace('call_timer:', '');
+        const timerData = await this.getCallTimer(callId);
+        if (timerData) {
+          timers[callId] = timerData;
+        }
+      }
+      return timers;
+    } catch (error) {
+      this.logger.error(`❌ Error getting all call timers: ${error.message}`);
+      return {};
+    }
+  }
+
+  // ============================================================================
   // FIRESTORE OPERATIONS (Persistent - For Admin Panel)
   // ============================================================================
 
@@ -329,44 +508,147 @@ class ScalabilityManager {
     }
   }
 
-  // Deduct coins from user wallet (for male users)
+  // ============================================================================
+  // SOLUTION #4: Atomic coin deduction using Firestore transactions
+  // Prevents race conditions and ensures data consistency
+  // ============================================================================
+
+  /**
+   * Atomically deduct coins from user wallet (for male users)
+   * Uses Firestore transaction to prevent race conditions
+   * @param {string} userId - User ID
+   * @param {number} amount - Amount to deduct
+   * @param {string} callId - Call ID for tracking
+   * @returns {Promise<{success: boolean, newBalance?: number, error?: string}>}
+   */
   async deductUserCoins(userId, amount, callId) {
     if (!this.firestore) {
       this.logger.warn('⚠️  Firestore not initialized, skipping coin deduction');
-      return false;
+      return { success: false, error: 'Firestore not initialized' };
     }
 
     try {
       const userRef = this.firestore.collection('users').doc(userId);
 
-      // Get current document to check which field to use
-      const userDoc = await userRef.get();
-      const data = userDoc.data() || {};
+      const result = await this.firestore.runTransaction(async (transaction) => {
+        const userDoc = await transaction.get(userRef);
 
-      // Determine which field to update (prefer coinBalance, fallback to coins)
-      const useNewField = data.coinBalance !== undefined;
-      const balanceField = useNewField ? 'coinBalance' : 'coins';
+        if (!userDoc.exists) {
+          throw new Error('User not found');
+        }
 
-      const updates = {
-        [balanceField]: admin.firestore.FieldValue.increment(-amount),
-        lastSpendAt: admin.firestore.FieldValue.serverTimestamp(),
-        lastCallId: callId
-      };
+        const data = userDoc.data();
 
-      await userRef.set(updates, { merge: true });
+        // Determine which field to use (prefer coinBalance, fallback to coins)
+        const useNewField = data.coinBalance !== undefined;
+        const balanceField = useNewField ? 'coinBalance' : 'coins';
+        const currentBalance = data[balanceField] || 0;
 
-      // Add to spending history
-      await this.firestore.collection('users').doc(userId).collection('spending').add({
-        amount: amount,
-        callId: callId,
-        timestamp: admin.firestore.FieldValue.serverTimestamp()
+        // Check if sufficient balance
+        if (currentBalance < amount) {
+          throw new Error(`Insufficient balance: has ${currentBalance}, needs ${amount}`);
+        }
+
+        const newBalance = currentBalance - amount;
+
+        // Update balance atomically within transaction
+        transaction.update(userRef, {
+          [balanceField]: newBalance,
+          lastSpendAt: admin.firestore.FieldValue.serverTimestamp(),
+          lastCallId: callId
+        });
+
+        // Create spending record in transaction
+        const spendingRef = this.firestore.collection('users').doc(userId).collection('spending').doc();
+        transaction.set(spendingRef, {
+          amount: amount,
+          callId: callId,
+          previousBalance: currentBalance,
+          newBalance: newBalance,
+          timestamp: admin.firestore.FieldValue.serverTimestamp(),
+          type: 'call_charge'
+        });
+
+        return { newBalance, previousBalance: currentBalance };
       });
 
-      this.logger.debug(`💸 Deducted coins from user ${userId}: -${amount} coins (field: ${balanceField})`);
-      return true;
+      this.logger.info(`💸 Atomically deducted ${amount} coins from user ${userId}: ${result.previousBalance} → ${result.newBalance}`);
+      return { success: true, newBalance: result.newBalance };
+
     } catch (error) {
-      this.logger.error(`❌ Error deducting user coins: ${error.message}`);
-      return false;
+      this.logger.error(`❌ Error deducting user coins (atomic): ${error.message}`);
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Atomically check balance and deduct coins in one operation
+   * Use this when starting a call to prevent race conditions
+   * @param {string} userId - User ID
+   * @param {number} amount - Amount to deduct
+   * @param {number} minRequired - Minimum balance required
+   * @param {string} callId - Call ID for tracking
+   * @returns {Promise<{success: boolean, newBalance?: number, error?: string}>}
+   */
+  async checkAndDeductCoins(userId, amount, minRequired, callId) {
+    if (!this.firestore) {
+      return { success: false, error: 'Firestore not initialized' };
+    }
+
+    try {
+      const userRef = this.firestore.collection('users').doc(userId);
+
+      const result = await this.firestore.runTransaction(async (transaction) => {
+        const userDoc = await transaction.get(userRef);
+
+        if (!userDoc.exists) {
+          throw new Error('User not found');
+        }
+
+        const data = userDoc.data();
+        const useNewField = data.coinBalance !== undefined;
+        const balanceField = useNewField ? 'coinBalance' : 'coins';
+        const currentBalance = data[balanceField] || 0;
+
+        // Check minimum required balance
+        if (currentBalance < minRequired) {
+          throw new Error(`INSUFFICIENT_BALANCE: has ${currentBalance}, requires ${minRequired}`);
+        }
+
+        const newBalance = currentBalance - amount;
+
+        // Reserve/deduct atomically
+        transaction.update(userRef, {
+          [balanceField]: newBalance,
+          lastSpendAt: admin.firestore.FieldValue.serverTimestamp(),
+          lastCallId: callId,
+          lastCallStartBalance: currentBalance
+        });
+
+        // Log the transaction
+        const spendingRef = this.firestore.collection('users').doc(userId).collection('spending').doc();
+        transaction.set(spendingRef, {
+          amount: amount,
+          callId: callId,
+          previousBalance: currentBalance,
+          newBalance: newBalance,
+          timestamp: admin.firestore.FieldValue.serverTimestamp(),
+          type: 'call_charge'
+        });
+
+        return { newBalance, previousBalance: currentBalance };
+      });
+
+      this.logger.info(`💰 Check+Deduct successful for ${userId}: ${result.previousBalance} → ${result.newBalance}`);
+      return { success: true, newBalance: result.newBalance };
+
+    } catch (error) {
+      if (error.message.startsWith('INSUFFICIENT_BALANCE')) {
+        this.logger.warn(`💰 Insufficient balance for ${userId}: ${error.message}`);
+        return { success: false, error: 'INSUFFICIENT_BALANCE', message: error.message };
+      }
+      this.logger.error(`❌ Error in checkAndDeductCoins: ${error.message}`);
+      return { success: false, error: error.message };
     }
   }
 
