@@ -9,12 +9,7 @@ const path = require('path');
 const crypto = require('crypto');
 const Razorpay = require('razorpay');
 const axios = require('axios');
-
-// ============================================================================
-// SOLUTION #12: Centralized Configuration
-// ============================================================================
-const config = require('./config');
-
+require('dotenv').config();
 // ============================================================================
 // SCALABILITY: Redis + PostgreSQL + Clustering Support
 // ============================================================================
@@ -25,19 +20,9 @@ const ScalabilityManager = require('./scalability');
 // ============================================================================
 const StatsSyncUtil = require('./utils/stats_sync_util');
 
-// ============================================================================
-// SOLUTION #10: Request Validation with Joi
-// ============================================================================
-const { validate, validateSocketData } = require('./middleware/validation');
-
-// ============================================================================
-// SOLUTION #15: Authentication Middleware
-// ============================================================================
-const { requireDiagnosticAuth } = require('./middleware/auth');
-
-// Enhanced logging setup (using config)
-const logLevel = config.logging.level;
-const enableDebugLogs = config.logging.enableDebug || !config.isProduction;
+// Enhanced logging setup
+const logLevel = process.env.LOG_LEVEL || 'info';
+const enableDebugLogs = process.env.ENABLE_DEBUG_LOGS === 'true' || process.env.NODE_ENV === 'development';
 
 // Create logs directory if it doesn't exist
 const logsDir = path.join(__dirname, 'logs');
@@ -45,69 +30,23 @@ if (!fs.existsSync(logsDir)) {
   fs.mkdirSync(logsDir, { recursive: true });
 }
 
-// ============================================================================
-// SOLUTION #13: Production-Optimized Logging
-// In production: Only log warnings, errors, and critical info
-// In development: Log everything for debugging
-// ============================================================================
-const isProduction = config.isProduction;
-const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
-const currentLogLevel = LOG_LEVELS[logLevel] || LOG_LEVELS.info;
-
-// Rate limiting for repetitive logs (prevent log spam)
-const logThrottleMap = new Map();
-const LOG_THROTTLE_MS = 5000; // Don't repeat same message within 5 seconds
-
-function shouldThrottleLog(message) {
-  if (!isProduction) return false; // No throttling in development
-
-  const key = message.slice(0, 50); // Use first 50 chars as key
-  const now = Date.now();
-  const lastLogged = logThrottleMap.get(key);
-
-  if (lastLogged && (now - lastLogged) < LOG_THROTTLE_MS) {
-    return true; // Throttle this log
-  }
-
-  logThrottleMap.set(key, now);
-
-  // Clean old entries periodically
-  if (logThrottleMap.size > 1000) {
-    for (const [k, v] of logThrottleMap.entries()) {
-      if (now - v > LOG_THROTTLE_MS * 10) {
-        logThrottleMap.delete(k);
-      }
-    }
-  }
-
-  return false;
-}
-
+// Enhanced console logging
 const logger = {
   info: (message, ...args) => {
-    if (currentLogLevel <= LOG_LEVELS.info) {
-      // In production, skip verbose info logs
-      if (isProduction && shouldThrottleLog(message)) return;
+    if (logLevel === 'debug' || logLevel === 'info') {
       console.log(`[INFO] ${new Date().toISOString()} - ${message}`, ...args);
     }
   },
   debug: (message, ...args) => {
-    if (enableDebugLogs && currentLogLevel <= LOG_LEVELS.debug) {
+    if (enableDebugLogs && (logLevel === 'debug')) {
       console.log(`[DEBUG] ${new Date().toISOString()} - ${message}`, ...args);
     }
   },
   warn: (message, ...args) => {
-    if (currentLogLevel <= LOG_LEVELS.warn) {
-      console.warn(`[WARN] ${new Date().toISOString()} - ${message}`, ...args);
-    }
+    console.warn(`[WARN] ${new Date().toISOString()} - ${message}`, ...args);
   },
   error: (message, ...args) => {
-    // Errors are always logged
     console.error(`[ERROR] ${new Date().toISOString()} - ${message}`, ...args);
-  },
-  // New: Critical info that should always be logged even in production
-  critical: (message, ...args) => {
-    console.log(`[CRITICAL] ${new Date().toISOString()} - ${message}`, ...args);
   }
 };
 
@@ -220,45 +159,13 @@ app.use(cors(corsOptions));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// ============================================================================
-// SOLUTION #9: Improved Rate Limiting Configuration
-// Changed from 100 requests/15 minutes to 60 requests/1 minute
-// Benefits: Better burst protection while maintaining same overall rate
-// ============================================================================
+// Rate limiting
 const limiter = rateLimit({
-  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 60 * 1000, // 1 minute window
-  max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 60, // 60 requests per minute
-  message: {
-    error: 'Too many requests from this IP, please try again later.',
-    retryAfter: 60 // seconds
-  },
-  standardHeaders: true, // Return rate limit info in `RateLimit-*` headers
-  legacyHeaders: false, // Disable `X-RateLimit-*` headers
-  skipSuccessfulRequests: false, // Count all requests
-  handler: (req, res) => {
-    logger.warn(`⚠️ Rate limit exceeded for IP: ${req.ip}`);
-    res.status(429).json({
-      error: 'Too many requests',
-      message: 'Please slow down. Try again in a minute.',
-      retryAfter: 60
-    });
-  }
+  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
+  max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 100,
+  message: 'Too many requests from this IP, please try again later.'
 });
-
-// Stricter rate limit for sensitive endpoints (auth, payment)
-const strictLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
-  max: 10, // Only 10 requests per minute for sensitive operations
-  message: { error: 'Too many attempts. Please wait before trying again.' },
-  standardHeaders: true,
-  legacyHeaders: false
-});
-
 app.use('/api/', limiter);
-// Apply strict limiter to sensitive endpoints
-app.use('/api/razorpay', strictLimiter);
-app.use('/api/payment', strictLimiter);
-app.use('/api/payout', strictLimiter);
 
 // ============================================================================
 // PRODUCTION ENHANCEMENTS: Call State Management
@@ -277,7 +184,7 @@ const callTimers = new Map(); // callId -> { interval, startTime, durationSecond
 // 🆕 DISCONNECT TIMEOUT: Auto-mark users unavailable after disconnect
 // When user disconnects, start a timer. If they don't reconnect within timeout, set isAvailable=false
 const disconnectTimeouts = new Map(); // userId -> { timeoutId, disconnectedAt, userType }
-const DISCONNECT_TIMEOUT_MS = config.timeouts.disconnect; // From config (default: 30 seconds)
+const DISCONNECT_TIMEOUT_MS = 30000; // 30 seconds timeout before marking unavailable
 
 // ============================================================================
 // 🆕 REDIS + FIRESTORE WRAPPERS (Non-blocking, Cluster-Safe)
@@ -286,19 +193,9 @@ const DISCONNECT_TIMEOUT_MS = config.timeouts.disconnect; // From config (defaul
 
 function setConnectedUserSync(userId, userData) {
   connectedUsers.set(userId, userData);
-  scalability.setConnectedUser(userId, userData).catch(err =>
+  scalability.setConnectedUser(userId, userData).catch(err => 
     logger.error(`Error syncing connected user to Redis: ${err.message}`)
   );
-}
-
-// SOLUTION #11: Update user activity timestamp (for FCM deduplication)
-function updateUserActivity(userId) {
-  const userData = connectedUsers.get(userId);
-  if (userData) {
-    userData.lastActivity = new Date();
-    connectedUsers.set(userId, userData);
-    // Don't sync to Redis on every activity update (too expensive)
-  }
 }
 
 function deleteConnectedUserSync(userId) {
@@ -446,94 +343,6 @@ if (!accountSid || !apiKeySid || !apiKeySecret) {
 
 logger.info('✅ Twilio credentials loaded successfully');
 
-// ============================================================================
-// SOLUTION #6: Fix isAvailable undefined for female users
-// Migration function to set default isAvailable for users where it's undefined
-// ============================================================================
-async function fixUndefinedAvailability() {
-  if (!scalability.firestore) {
-    logger.warn('⚠️ Firestore not initialized, cannot run migration');
-    return { fixed: 0, total: 0 };
-  }
-
-  try {
-    const usersRef = scalability.firestore.collection('users');
-    const snapshot = await usersRef.where('gender', '==', 'female').get();
-
-    let fixed = 0;
-    const batch = scalability.firestore.batch();
-
-    for (const doc of snapshot.docs) {
-      const data = doc.data();
-      if (data.isAvailable === undefined) {
-        batch.update(doc.ref, {
-          isAvailable: false,  // Default to unavailable - user must explicitly turn on
-          availabilityFixedAt: new Date(),
-          availabilityFixReason: 'migration_undefined_fix'
-        });
-        fixed++;
-        logger.info(`🔧 Will fix undefined isAvailable for user ${doc.id}`);
-      }
-    }
-
-    if (fixed > 0) {
-      await batch.commit();
-      logger.info(`✅ Fixed ${fixed} users with undefined isAvailable`);
-    } else {
-      logger.info('✅ No users found with undefined isAvailable');
-    }
-
-    return { fixed, total: snapshot.docs.length };
-  } catch (error) {
-    logger.error('❌ Error fixing undefined availability:', error.message);
-    throw error;
-  }
-}
-
-// Run migration on startup (non-blocking)
-setTimeout(async () => {
-  try {
-    const result = await fixUndefinedAvailability();
-    logger.info(`📊 Availability migration complete: ${result.fixed}/${result.total} users fixed`);
-  } catch (error) {
-    logger.error('❌ Failed to run availability migration:', error.message);
-  }
-}, 5000); // Wait 5s for Firestore to initialize
-
-// ============================================================================
-// SOLUTION #2: Periodic cleanup job for stale call timers
-// Runs every minute to clean up timers older than 1 hour (3600 seconds)
-// This prevents memory leaks from abandoned calls
-// ============================================================================
-const STALE_TIMER_THRESHOLD_MS = config.cleanup.staleTimerThreshold; // From config (default: 1 hour)
-const CLEANUP_INTERVAL_MS = config.cleanup.cleanupInterval; // From config (default: 1 minute)
-
-setInterval(() => {
-  const now = Date.now();
-  let cleanedCount = 0;
-
-  for (const [callId, timer] of callTimers.entries()) {
-    const timerAge = now - timer.startTime;
-    if (timerAge > STALE_TIMER_THRESHOLD_MS) {
-      clearInterval(timer.interval);
-      callTimers.delete(callId);
-      cleanedCount++;
-      logger.warn(`🧹 Cleaned up stale timer: ${callId} (age: ${Math.floor(timerAge / 1000 / 60)} minutes)`);
-
-      // Also clean from Redis
-      scalability.deleteCallTimer(callId).catch(err =>
-        logger.error(`Error cleaning stale timer from Redis: ${err.message}`)
-      );
-    }
-  }
-
-  if (cleanedCount > 0) {
-    logger.info(`🧹 Periodic cleanup: removed ${cleanedCount} stale call timers`);
-  }
-}, CLEANUP_INTERVAL_MS);
-
-logger.info(`✅ Periodic stale timer cleanup job initialized (runs every ${CLEANUP_INTERVAL_MS/1000}s)`);
-
 // Generate Twilio Access Token - Enhanced Security
 function generateSecureAccessToken(identity, roomName, isVideo = true) {
   try {
@@ -615,8 +424,7 @@ app.get('/api/health', async (req, res) => {
 });
 
 // 🆕 DIAGNOSTIC ENDPOINT: Check Socket.IO connections and rooms
-// SOLUTION #15: Protected with API key authentication
-app.get('/api/diagnostic/connections', requireDiagnosticAuth, (req, res) => {
+app.get('/api/diagnostic/connections', (req, res) => {
   try {
     const diagnostics = {
       timestamp: new Date().toISOString(),
@@ -685,8 +493,7 @@ app.get('/api/diagnostic/connections', requireDiagnosticAuth, (req, res) => {
 });
 
 // 🆕 DIAGNOSTIC ENDPOINT: Check specific user connection
-// SOLUTION #15: Protected with API key authentication
-app.get('/api/diagnostic/user/:userId', requireDiagnosticAuth, (req, res) => {
+app.get('/api/diagnostic/user/:userId', (req, res) => {
   try {
     const { userId } = req.params;
     
@@ -934,9 +741,13 @@ app.post('/api/validate_balance', async (req, res) => {
 });
 
 // 🆕 PRODUCTION ENDPOINT: Check user availability (concurrent call prevention)
-app.post('/api/check_availability', validate('checkAvailability'), async (req, res) => {
+app.post('/api/check_availability', async (req, res) => {
   try {
     const { recipient_id } = req.body;
+
+    if (!recipient_id) {
+      return res.status(400).json({ error: 'Missing recipient_id' });
+    }
 
     // 🔧 UNIFIED STATUS CHECK: Use only 'available' and 'unavailable'
     // Key principle: User must have BOTH active connection AND preference=available to receive calls
@@ -1131,9 +942,16 @@ app.post('/api/check_call_status', async (req, res) => {
 });
 
 // 🆕 PRODUCTION ENDPOINT: Update user availability status (for female users)
-app.post('/api/update_availability', validate('updateAvailability'), async (req, res) => {
+app.post('/api/update_availability', async (req, res) => {
   try {
     const { user_id, is_available } = req.body;
+
+    if (!user_id || typeof is_available !== 'boolean') {
+      return res.status(400).json({
+        error: 'Missing required fields',
+        required: { user_id: 'string', is_available: 'boolean' }
+      });
+    }
 
     logger.info(`📱 Availability update request - User: ${user_id}, Available: ${is_available}`);
 
@@ -1966,20 +1784,7 @@ io.on('connection', (socket) => {
   const userAgent = socket.handshake.headers['user-agent'];
   logger.info(`🔌 User connected: ${socket.id} from ${clientIp}`);
   logger.debug(`   User-Agent: ${userAgent}`);
-
-  // SOLUTION #11: Track activity on any socket message (for FCM deduplication)
-  // This ensures lastActivity is updated whenever client sends any event
-  socket.use((packet, next) => {
-    // Find userId from socket (stored during join)
-    for (const [userId, userData] of connectedUsers.entries()) {
-      if (userData.socketId === socket.id) {
-        updateUserActivity(userId);
-        break;
-      }
-    }
-    next();
-  });
-
+  
   // Send welcome message
   socket.emit('connected', {
     socketId: socket.id,
@@ -2035,47 +1840,40 @@ io.on('connection', (socket) => {
       }
     }
 
-    // Store user connection with activity tracking (for SOLUTION #11 - FCM deduplication)
+    // Store user connection
     setConnectedUserSync(userId, {
       socketId: socket.id,
       userType: userType || 'unknown',
       connectedAt: new Date(),
-      lastActivity: new Date(), // Track last activity for FCM deduplication
       isOnline: true
     });
     logger.info(`🚪 User ${userId} stored in connectedUsers map`);
 
-    // 🆕 SOLUTION #5: Fix user status on reconnect
-    // Always reset status when user reconnects - fixes "disconnected" status bug
+    // 🆕 Set user status based on saved preference from Firestore (if available)
     const currentStatus = userStatus.get(userId);
-
-    // Try to get saved availability preference from Firestore
-    let savedPreference = true; // Default to available
-    try {
-      const userDoc = await scalability.firestore.collection('users').doc(userId).get();
-      if (userDoc.exists) {
-        const userData = userDoc.data();
-        savedPreference = userData.isAvailable !== false; // Default true if not set
-        logger.info(`💾 Loaded saved availability preference for ${userId}: ${savedPreference}`);
+    if (!currentStatus || currentStatus.status === 'unavailable') {
+      // Try to get saved availability preference from Firestore
+      let savedPreference = true; // Default to available
+      try {
+        const userDoc = await scalability.firestore.collection('users').doc(userId).get();
+        if (userDoc.exists) {
+          const userData = userDoc.data();
+          savedPreference = userData.isAvailable !== false; // Default true if not set
+          logger.info(`💾 Loaded saved availability preference for ${userId}: ${savedPreference}`);
+        }
+      } catch (firestoreError) {
+        logger.warn(`⚠️ Could not load availability preference from Firestore: ${firestoreError.message}`);
       }
-    } catch (firestoreError) {
-      logger.warn(`⚠️ Could not load availability preference from Firestore: ${firestoreError.message}`);
-    }
 
-    // ALWAYS reset status on reconnect (fixes "disconnected" staying forever)
-    // Clear any stale call references - user reconnecting means they're not in a call
-    setUserStatusSync(userId, {
-      status: savedPreference ? 'available' : 'unavailable',
-      currentCallId: null,  // Clear any stale call ID
-      lastStatusChange: new Date(),
-      userPreference: savedPreference,
-      reconnectedAt: new Date()  // Track reconnection time
-    });
-
-    if (currentStatus && currentStatus.status === 'disconnected') {
-      logger.info(`🔄 User ${userId} reconnected - Status changed from 'disconnected' to '${savedPreference ? 'available' : 'unavailable'}'`);
-    } else {
+      setUserStatusSync(userId, {
+        status: savedPreference ? 'available' : 'unavailable',
+        currentCallId: null,
+        lastStatusChange: new Date(),
+        userPreference: savedPreference
+      });
       logger.info(`🚪 User ${userId} status set to: ${savedPreference ? 'available' : 'unavailable'}`);
+    } else {
+      logger.info(`🚪 User ${userId} status remains: ${currentStatus.status}`);
     }
 
     // Join user-specific room
@@ -2229,26 +2027,6 @@ io.on('connection', (socket) => {
     const finalRoomName = roomName || `${callType}_${callerId}_${recipientId}`;
 
     logger.info(`📞 Generated call ID: ${finalCallId}`);
-
-    // =========================================================================
-    // SOLUTION #3: Acquire distributed lock to prevent race conditions
-    // This ensures only ONE caller can reach a recipient at a time
-    // =========================================================================
-    const lockAcquired = await scalability.acquireCallLock(recipientId, callerId, 60);
-    if (!lockAcquired) {
-      // Check who is calling
-      const lockHolder = await scalability.getCallLockHolder(recipientId);
-      logger.warn(`📞 Call blocked: Recipient ${recipientId} is being called by ${lockHolder}`);
-
-      socket.emit('call_failed', {
-        callId: finalCallId,
-        reason: 'Recipient is already receiving another call',
-        recipient_status: 'ringing',
-        message: 'This user is currently receiving another call. Please try again shortly.'
-      });
-      return;
-    }
-    logger.info(`🔒 Call lock acquired for ${recipientId} - proceeding with call`);
     logger.info(`📞 Generated room name: ${finalRoomName}`);
 
     // Create call object
@@ -2320,39 +2098,20 @@ io.on('connection', (socket) => {
       io.to(recipientSocketId).emit('incoming_call', incomingCallPayload);
       logger.info(`📡 ✅ incoming_call emitted to recipient only`);
 
-      // ============================================================================
-      // SOLUTION #11: Prevent Double Notifications (WebSocket + FCM)
-      // Only send FCM if we're uncertain WebSocket was received (app might be in background)
-      // Track last activity to determine if FCM backup is needed
-      // ============================================================================
-      const recipientData = connectedUsers.get(recipientId);
-      const lastActivityMs = recipientData?.lastActivity ?
-        Date.now() - new Date(recipientData.lastActivity).getTime() :
-        Infinity;
-
-      // Only send FCM backup if:
-      // 1. Last activity was more than threshold (app might be in background)
-      // 2. OR we're unsure about the connection state
-      const needsFcmBackup = lastActivityMs > config.timeouts.fcmBackupThreshold;
-
-      if (needsFcmBackup) {
-        try {
-          const fcmBackup = await scalability.sendIncomingCallNotification(recipientId, {
-            callId: finalCallId,
-            callerId: callerId,
-            callerName: callerName,
-            roomName: finalRoomName,
-            callType: callType,
-            isBackup: true, // Flag so client knows this is a backup
-          });
-          if (fcmBackup) {
-            logger.info(`📱 Backup FCM notification sent (last activity ${Math.round(lastActivityMs/1000)}s ago)`);
-          }
-        } catch (fcmError) {
-          logger.warn(`⚠️ Backup FCM failed (non-critical): ${fcmError.message}`);
+      // 🔧 ALSO send FCM as backup (in case app goes to background during call initiation)
+      try {
+        const fcmBackup = await scalability.sendIncomingCallNotification(recipientId, {
+          callId: finalCallId,
+          callerId: callerId,
+          callerName: callerName,
+          roomName: finalRoomName,
+          callType: callType,
+        });
+        if (fcmBackup) {
+          logger.info(`📱 Backup FCM notification also sent to ${recipientId}`);
         }
-      } else {
-        logger.debug(`📱 Skipping FCM backup - WebSocket active (${Math.round(lastActivityMs/1000)}s ago)`);
+      } catch (fcmError) {
+        logger.warn(`⚠️ Backup FCM failed (non-critical): ${fcmError.message}`);
       }
 
       call.status = 'ringing';
@@ -2487,10 +2246,9 @@ io.on('connection', (socket) => {
   });
 
   // 🆕 ENHANCED: Accept call with busy status update
-  socket.on('accept_call', async (data) => {
+  socket.on('accept_call', (data) => {
     const { callId, callerId, recipientId } = data;
-    updateUserActivity(recipientId); // Track activity for FCM deduplication
-
+    
     const call = activeCalls.get(callId);
     if (!call) {
       socket.emit('error', { message: 'Call not found' });
@@ -2501,10 +2259,6 @@ io.on('connection', (socket) => {
       socket.emit('error', { message: 'Unauthorized to accept this call' });
       return;
     }
-
-    // 🆕 SOLUTION #3: Release the call lock (call is now established)
-    await scalability.releaseCallLock(recipientId, callerId);
-    logger.info(`🔓 Call lock released for ${recipientId} (call accepted)`);
 
     // 🆕 Mark both users as busy
     setUserStatusSync(callerId, {
@@ -2526,7 +2280,7 @@ io.on('connection', (socket) => {
     const caller = connectedUsers.get(callerId);
     if (caller) {
       logger.info(`✅ Call accepted: ${callId} by ${recipientId} - Notifying caller ${callerId} (socket: ${caller.socketId})`);
-
+      
       io.to(caller.socketId).emit('call_accepted', {
         callId,
         roomName: call.roomName,
@@ -2541,10 +2295,9 @@ io.on('connection', (socket) => {
   });
 
   // 🆕 ENHANCED: Decline call with status cleanup
-  socket.on('decline_call', async (data) => {
+  socket.on('decline_call', (data) => {
     const { callId, callerId, recipientId } = data;
-    updateUserActivity(recipientId); // Track activity for FCM deduplication
-
+    
     const call = activeCalls.get(callId);
     if (!call) {
       socket.emit('error', { message: 'Call not found' });
@@ -2553,19 +2306,6 @@ io.on('connection', (socket) => {
 
     call.status = 'declined';
     call.declinedAt = new Date();
-
-    // 🆕 SOLUTION #3: Release the call lock
-    await scalability.releaseCallLock(recipientId, callerId);
-    logger.info(`🔓 Call lock released for ${recipientId} (call declined)`);
-
-    // 🆕 SOLUTION #2: Clean up call timer if it exists
-    const timer = callTimers.get(callId);
-    if (timer) {
-      clearInterval(timer.interval);
-      callTimers.delete(callId);
-      await scalability.deleteCallTimer(callId);
-      logger.info(`⏱️ Timer cleaned up for declined call ${callId}`);
-    }
 
     // 🆕 Reset recipient status to available
     setUserStatusSync(recipientId, {
@@ -2578,7 +2318,7 @@ io.on('connection', (socket) => {
     const caller = connectedUsers.get(callerId);
     if (caller) {
       logger.info(`❌ Call declined: ${callId} by ${recipientId} - Notifying caller ${callerId} (socket: ${caller.socketId})`);
-
+      
       // FIXED: Only emit to caller's socket directly
       io.to(caller.socketId).emit('call_declined', {
         callId,
@@ -2637,7 +2377,7 @@ io.on('connection', (socket) => {
   // 🆕 ENHANCED: End call with status cleanup and timer stop
   socket.on('end_call', async (data) => {
     const { callId, userId } = data;
-
+    
     const call = activeCalls.get(callId);
     if (!call) {
       socket.emit('error', { message: 'Call not found' });
@@ -2648,18 +2388,11 @@ io.on('connection', (socket) => {
     call.endedAt = new Date();
     call.endedBy = userId;
 
-    // 🆕 SOLUTION #3: Release call lock if still held
-    if (call.callerId && call.recipientId) {
-      await scalability.releaseCallLock(call.recipientId, call.callerId);
-    }
-
-    // 🆕 SOLUTION #2: Stop server-side timer and clean up from Redis
+    // 🆕 Stop server-side timer if exists
     const serverTimer = callTimers.get(callId);
     if (serverTimer) {
       clearInterval(serverTimer.interval);
-      callTimers.delete(callId);
-      await scalability.deleteCallTimer(callId);
-      logger.info(`⏱️  Stopped and cleaned up timer for call ${callId}: ${serverTimer.durationSeconds}s`);
+      logger.info(`⏱️  Stopped server timer for call ${callId}: ${serverTimer.durationSeconds}s`);
     }
 
     // 🆕 Reset both users' status to available
@@ -2670,7 +2403,7 @@ io.on('connection', (socket) => {
           currentCallId: null,
           lastStatusChange: new Date()
         });
-
+        
         // 🔧 FIX: Use io.to() to notify participants
         const participant = connectedUsers.get(participantId);
         if (participant) {
@@ -2703,21 +2436,6 @@ io.on('connection', (socket) => {
     logger.info(`📞 Call ID: ${callId}`);
     logger.info(`📞 Caller: ${callerId}, Recipient: ${recipientId}`);
     logger.info(`📞 Cancelled by: ${userId}, Reason: ${reason}`);
-
-    // 🆕 SOLUTION #3: Release call lock immediately
-    if (recipientId && callerId) {
-      await scalability.releaseCallLock(recipientId, callerId);
-      logger.info(`🔓 Call lock released for ${recipientId} (call cancelled)`);
-    }
-
-    // 🆕 SOLUTION #2: Clean up any timer
-    const timer = callTimers.get(callId);
-    if (timer) {
-      clearInterval(timer.interval);
-      callTimers.delete(callId);
-      await scalability.deleteCallTimer(callId);
-      logger.info(`⏱️ Timer cleaned up for cancelled call ${callId}`);
-    }
 
     const call = activeCalls.get(callId);
 
@@ -3018,19 +2736,9 @@ process.on('SIGINT', () => {
 });
 
 // Handle uncaught exceptions
-// SOLUTION #14: Fixed typo - was 'uncaught Exception', should be 'uncaughtException'
-process.on('uncaughtException', (err) => {
+process.on('uncaught Exception', (err) => {
   logger.error('💥 Uncaught Exception:', err);
-  // Graceful shutdown
-  server.close(() => {
-    logger.error('💥 Server closed due to uncaught exception');
-    process.exit(1);
-  });
-  // Force exit if graceful shutdown takes too long
-  setTimeout(() => {
-    logger.error('💥 Forcing exit after uncaught exception');
-    process.exit(1);
-  }, 5000);
+  process.exit(1);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
