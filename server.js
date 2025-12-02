@@ -1619,8 +1619,7 @@ app.post('/api/start_call_tracking', async (req, res) => {
       recipientId: recipient_id,
       callType: call_type,
       coinRate,
-      roomName: room_name,
-      lastHeartbeat: startTime // 🔧 FIX: Initialize lastHeartbeat to prevent immediate timeout
+      roomName: room_name
     });
 
     logger.info(`⏱️  Started server-side tracking for call ${call_id} (${call_type})`);
@@ -2039,14 +2038,9 @@ app.post('/api/calls/heartbeat', async (req, res) => {
     
     const currentDuration = serverTimer.durationSeconds;
     const estimatedCoins = Math.ceil(currentDuration * serverTimer.coinRate);
-
+    
     serverTimer.lastHeartbeat = Date.now();
-
-    // 🔧 FIX: Log heartbeat receipt for debugging
-    if (currentDuration % 30 === 0 || currentDuration < 20) {
-      logger.info(`💓 Heartbeat received: call ${callId}, duration: ${currentDuration}s, cost: ${estimatedCoins} coins`);
-    }
-
+    
     res.json({
       success: true,
       callId,
