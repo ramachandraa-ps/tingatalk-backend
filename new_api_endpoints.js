@@ -113,7 +113,8 @@ app.post('/api/calls/start', async (req, res) => {
       recipientId,
       callType,
       coinRate,
-      roomName: callData.roomName
+      roomName: callData.roomName,
+      lastHeartbeat: startTime // 🔧 FIX: Initialize lastHeartbeat to prevent immediate timeout
     });
     
     // Store in Redis and mark users as busy
