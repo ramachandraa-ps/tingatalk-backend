@@ -1663,153 +1663,57 @@ app.post('/api/calls/start', async (req, res) => {
   }
 });
 
-// 🆕 PHASE 1 FIX: Complete call with server-side billing + fraud detection logging + graceful fallback
+// Complete call with server-side billing
 app.post('/api/calls/complete', async (req, res) => {
   try {
-    // Accept both new and legacy field names for backwards compatibility
-    const {
-      callId, call_id,
-      callerId, caller_id,
-      recipientId, recipient_id,
-      endReason,
-      client_duration_seconds,  // From legacy endpoint - for fraud detection
-      client_coins_deducted     // From legacy endpoint - for fraud detection
-    } = req.body;
-
-    const finalCallId = callId || call_id;
-    const finalCallerId = callerId || caller_id;
-    const finalRecipientId = recipientId || recipient_id;
-
-    if (!finalCallId) {
-      return res.status(400).json({ error: 'Missing required field: callId' });
+    const { callId, callerId, recipientId, endReason } = req.body;
+    
+    if (!callId || !callerId || !recipientId) {
+      return res.status(400).json({ error: 'Missing required fields: callId, callerId, recipientId' });
     }
-
-    logger.info(`🏁 Completing call: ${finalCallId}`);
-
-    const serverTimer = callTimers.get(finalCallId);
-
-    // 🆕 GRACEFUL FALLBACK: If no server timer found, handle gracefully instead of 404
+    
+    logger.info(`🏁 Completing call: ${callId}`);
+    
+    const serverTimer = callTimers.get(callId);
+    
     if (!serverTimer) {
-      logger.warn(`⚠️  No server timer found for call ${finalCallId}`);
-
-      // If client provided duration, use it as fallback (with warning)
-      if (client_duration_seconds !== undefined) {
-        logger.warn(`⚠️  Using client-reported duration as fallback: ${client_duration_seconds}s`);
-
-        // Still update Firestore to mark call as completed
-        try {
-          await scalability.updateCallInFirestore(finalCallId, {
-            status: 'completed',
-            durationSeconds: client_duration_seconds || 0,
-            coinsDeducted: client_coins_deducted || 0,
-            endedAt: new Date().toISOString(),
-            endReason: endReason || 'User ended call',
-            billingSource: 'client_fallback',
-            warning: 'Server timer not found, used client-reported values'
-          });
-        } catch (firestoreError) {
-          logger.error(`❌ Firestore update failed: ${firestoreError.message}`);
-        }
-
-        return res.json({
-          success: true,
-          callId: finalCallId,
-          durationSeconds: client_duration_seconds || 0,
-          coinsDeducted: client_coins_deducted || 0,
-          newBalance: null,
-          source: 'client_fallback',
-          warning: 'Server timer not found, used client-reported values',
-          message: 'Call completed with client-reported duration'
-        });
-      }
-
-      // No client duration either - call may have already been completed
-      return res.json({
-        success: true,
-        callId: finalCallId,
-        durationSeconds: 0,
-        coinsDeducted: 0,
-        newBalance: null,
-        source: 'already_completed',
-        warning: 'Call not found - may have already been completed',
-        message: 'Call completion acknowledged'
-      });
+      return res.status(404).json({ error: 'Call not found or already completed' });
     }
-
+    
     clearInterval(serverTimer.interval);
     const serverDuration = serverTimer.durationSeconds;
     const coinsDeducted = Math.ceil(serverDuration * serverTimer.coinRate);
-
+    
     logger.info(`   Server Duration: ${serverDuration}s`);
     logger.info(`   Coins to Deduct: ${coinsDeducted}`);
-
-    // 🆕 FRAUD DETECTION LOGGING (merged from legacy /api/complete_call)
-    let fraudDetection = null;
-    if (client_duration_seconds !== undefined) {
-      const durationDiff = Math.abs(serverDuration - client_duration_seconds);
-      const isSuspicious = durationDiff > 5; // More than 5 seconds difference
-
-      fraudDetection = {
-        clientDuration: client_duration_seconds,
-        serverDuration: serverDuration,
-        differenceSeconds: durationDiff,
-        isSuspicious: isSuspicious
-      };
-
-      if (isSuspicious) {
-        logger.warn(`⚠️  FRAUD ALERT: Call ${finalCallId} duration mismatch`);
-        logger.warn(`   Server: ${serverDuration}s, Client: ${client_duration_seconds}s, Diff: ${durationDiff}s`);
-      } else {
-        logger.info(`✅ Duration validation passed: Server ${serverDuration}s, Client ${client_duration_seconds}s`);
-      }
-    }
-
-    // Deduct coins (server duration is source of truth)
-    await scalability.deductUserCoins(finalCallerId || serverTimer.callerId, coinsDeducted, finalCallId);
-    const newBalance = await scalability.getUserBalance(finalCallerId || serverTimer.callerId);
-
-    await scalability.updateCallInFirestore(finalCallId, {
+    
+    await scalability.deductUserCoins(callerId, coinsDeducted, callId);
+    const newBalance = await scalability.getUserBalance(callerId);
+    
+    await scalability.updateCallInFirestore(callId, {
       status: 'completed',
       durationSeconds: serverDuration,
       coinsDeducted,
       endedAt: new Date().toISOString(),
-      endReason: endReason || 'User ended call',
-      billingSource: 'server',
-      fraudDetection: fraudDetection
+      endReason: endReason || 'User ended call'
     });
-
-    callTimers.delete(finalCallId);
-
-    // 🆕 Reset user statuses to available
-    setUserStatusSync(serverTimer.callerId, {
-      status: 'available',
-      currentCallId: null,
-      lastStatusChange: new Date()
-    });
-    setUserStatusSync(serverTimer.recipientId, {
-      status: 'available',
-      currentCallId: null,
-      lastStatusChange: new Date()
-    });
-
-    logger.info(`✅ Call completed: ${finalCallId}, deducted: ${coinsDeducted} coins, new balance: ${newBalance}`);
-
+    
+    callTimers.delete(callId);
+    
+    logger.info(`✅ Call completed: ${callId}, deducted: ${coinsDeducted} coins, new balance: ${newBalance}`);
+    
     res.json({
       success: true,
-      callId: finalCallId,
+      callId,
       durationSeconds: serverDuration,
       coinsDeducted,
       newBalance,
-      coinRate: serverTimer.coinRate,
-      callType: serverTimer.callType,
-      source: 'server',
-      fraudDetection: fraudDetection,
       message: 'Call completed and billed successfully'
     });
-
+    
   } catch (error) {
     logger.error('❌ Error completing call:', error);
-    res.status(500).json({
+    res.status(500).json({ 
       error: 'Failed to complete call',
       details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
     });
@@ -2341,10 +2245,10 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 🆕 ENHANCED: Accept call with busy status update + AUTO-START SERVER BILLING TIMER
-  socket.on('accept_call', async (data) => {
+  // 🆕 ENHANCED: Accept call with busy status update
+  socket.on('accept_call', (data) => {
     const { callId, callerId, recipientId } = data;
-
+    
     const call = activeCalls.get(callId);
     if (!call) {
       socket.emit('error', { message: 'Call not found' });
@@ -2372,66 +2276,11 @@ io.on('connection', (socket) => {
     call.participants.push(recipientId);
     call.acceptedAt = new Date();
 
-    // 🆕 PHASE 1 FIX: Auto-start server billing timer when call is accepted
-    // This ensures server tracks call duration for billing even without explicit /api/calls/start
-    if (!callTimers.has(callId)) {
-      const coinRate = call.callType === 'video' ? COIN_RATES.video : COIN_RATES.audio;
-      const startTime = Date.now();
-
-      // Create server-side timer for billing
-      const interval = setInterval(() => {
-        const timer = callTimers.get(callId);
-        if (timer) {
-          timer.durationSeconds++;
-          // Log every 30 seconds for monitoring
-          if (timer.durationSeconds % 30 === 0) {
-            logger.info(`⏱️  Call ${callId} duration: ${timer.durationSeconds}s (auto-started on accept)`);
-          }
-        }
-      }, 1000);
-
-      callTimers.set(callId, {
-        interval,
-        durationSeconds: 0,
-        coinRate,
-        callerId,
-        recipientId,
-        callType: call.callType,
-        startTime,
-        lastHeartbeat: Date.now(),
-        autoStarted: true  // Flag to indicate this was auto-started
-      });
-
-      logger.info(`⏱️  Auto-started server billing timer for call ${callId} (${call.callType}) - Rate: ${coinRate} coins/sec`);
-
-      // 🆕 Also save call to Firestore with 'active' status
-      try {
-        await scalability.saveCallToFirestore({
-          callId,
-          callerId,
-          recipientId,
-          callType: call.callType,
-          roomName: call.roomName,
-          status: 'active',
-          coinRate,
-          startedAt: new Date().toISOString(),
-          acceptedAt: call.acceptedAt.toISOString(),
-          durationSeconds: 0,
-          coinsDeducted: 0
-        });
-        logger.info(`📝 Call ${callId} saved to Firestore with 'active' status`);
-      } catch (firestoreError) {
-        logger.error(`❌ Failed to save call to Firestore: ${firestoreError.message}`);
-      }
-    } else {
-      logger.info(`⏱️  Server billing timer already exists for call ${callId}`);
-    }
-
     // FIXED: Only emit to caller's socket directly
     const caller = connectedUsers.get(callerId);
     if (caller) {
       logger.info(`✅ Call accepted: ${callId} by ${recipientId} - Notifying caller ${callerId} (socket: ${caller.socketId})`);
-
+      
       io.to(caller.socketId).emit('call_accepted', {
         callId,
         roomName: call.roomName,
@@ -2442,7 +2291,7 @@ io.on('connection', (socket) => {
       logger.warn(`⚠️  Caller ${callerId} not found in connected users`);
     }
 
-    logger.info(`✅ Call accepted: ${callId} by ${recipientId} - Both users marked as busy, billing timer started`);
+    logger.info(`✅ Call accepted: ${callId} by ${recipientId} - Both users marked as busy`);
   });
 
   // 🆕 ENHANCED: Decline call with status cleanup
@@ -2839,92 +2688,6 @@ app.use((err, req, res, next) => {
 app.use('*', (req, res) => {
   res.status(404).json({ error: 'Endpoint not found' });
 });
-
-// 🆕 PHASE 1 FIX: Heartbeat timeout monitoring
-// Auto-end calls that haven't received a heartbeat in 60 seconds
-const HEARTBEAT_TIMEOUT_MS = 60000; // 60 seconds
-const HEARTBEAT_CHECK_INTERVAL_MS = 30000; // Check every 30 seconds
-
-setInterval(() => {
-  const now = Date.now();
-  let staleCallsFound = 0;
-
-  callTimers.forEach(async (timer, callId) => {
-    const timeSinceLastHeartbeat = now - timer.lastHeartbeat;
-
-    if (timeSinceLastHeartbeat > HEARTBEAT_TIMEOUT_MS) {
-      staleCallsFound++;
-      logger.warn(`⚠️  STALE CALL DETECTED: ${callId} - No heartbeat for ${Math.round(timeSinceLastHeartbeat / 1000)}s`);
-
-      // Stop the timer
-      clearInterval(timer.interval);
-      const finalDuration = timer.durationSeconds;
-      const coinsToDeduct = Math.ceil(finalDuration * timer.coinRate);
-
-      logger.info(`⏱️  Auto-ending stale call ${callId}: ${finalDuration}s, ${coinsToDeduct} coins`);
-
-      // Deduct coins and update Firestore
-      try {
-        await scalability.deductUserCoins(timer.callerId, coinsToDeduct, callId);
-        await scalability.updateCallInFirestore(callId, {
-          status: 'timeout_heartbeat',
-          durationSeconds: finalDuration,
-          coinsDeducted: coinsToDeduct,
-          endedAt: new Date().toISOString(),
-          endReason: 'No heartbeat received - connection lost'
-        });
-        logger.info(`✅ Stale call ${callId} billed and closed: ${coinsToDeduct} coins deducted`);
-      } catch (error) {
-        logger.error(`❌ Error closing stale call ${callId}: ${error.message}`);
-      }
-
-      // Clean up
-      callTimers.delete(callId);
-
-      // Reset user statuses
-      setUserStatusSync(timer.callerId, {
-        status: 'available',
-        currentCallId: null,
-        lastStatusChange: new Date()
-      });
-      setUserStatusSync(timer.recipientId, {
-        status: 'available',
-        currentCallId: null,
-        lastStatusChange: new Date()
-      });
-
-      // Notify users via WebSocket if connected
-      const callerConn = connectedUsers.get(timer.callerId);
-      const recipientConn = connectedUsers.get(timer.recipientId);
-
-      if (callerConn) {
-        io.to(callerConn.socketId).emit('call_ended', {
-          callId,
-          endedBy: 'server',
-          reason: 'Connection timeout - no heartbeat',
-          duration: finalDuration
-        });
-      }
-      if (recipientConn) {
-        io.to(recipientConn.socketId).emit('call_ended', {
-          callId,
-          endedBy: 'server',
-          reason: 'Connection timeout - no heartbeat',
-          duration: finalDuration
-        });
-      }
-
-      // Also clean up from activeCalls
-      deleteActiveCallSync(callId);
-    }
-  });
-
-  if (staleCallsFound > 0) {
-    logger.info(`🧹 Heartbeat monitor: Found and cleaned ${staleCallsFound} stale call(s)`);
-  }
-}, HEARTBEAT_CHECK_INTERVAL_MS);
-
-logger.info(`✅ Heartbeat timeout monitor initialized (timeout: ${HEARTBEAT_TIMEOUT_MS / 1000}s, check interval: ${HEARTBEAT_CHECK_INTERVAL_MS / 1000}s)`);
 
 // Start server
 const PORT = process.env.PORT || 3000;
