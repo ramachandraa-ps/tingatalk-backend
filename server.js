@@ -2866,7 +2866,7 @@ app.use('*', (req, res) => {
 const HEARTBEAT_TIMEOUT_MS = 180000; // 3 minutes - more tolerant of network hiccups
 const HEARTBEAT_CHECK_INTERVAL_MS = 60000; // Check every 60 seconds (was 30s)
 
-setInterval(() => {
+setInterval(async () => {
   const now = Date.now();
   let staleCallsFound = 0;
 
