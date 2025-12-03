@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
@@ -130,7 +130,7 @@ const io = socketIo(server, {
   cors: corsOptions,
   transports: ['websocket', 'polling'],
   pingInterval: 25000,    // Send ping every 25 seconds
-  pingTimeout: 90000, // 🔧 PHASE 3 FIX: Increased from 60s to 90s for mobile networks     // Wait 60 seconds for pong response
+  pingTimeout: 60000, //  CRASH FIX: Reduced to 60s for faster disconnect detection
   connectTimeout: 45000,  // 45 seconds to establish connection
   upgradeTimeout: 30000,  // 30 seconds to upgrade from polling to websocket
 });
@@ -2842,7 +2842,7 @@ app.use('*', (req, res) => {
 
 // 🆕 PHASE 1 FIX: Heartbeat timeout monitoring
 // Auto-end calls that haven't received a heartbeat in 60 seconds
-const HEARTBEAT_TIMEOUT_MS = 120000; // 🔧 PHASE 3 FIX: Increased from 60s to 120s for mobile networks // 60 seconds
+const HEARTBEAT_TIMEOUT_MS = 60000; //  CRASH FIX: Reduced to 60s for faster stale call detection
 const HEARTBEAT_CHECK_INTERVAL_MS = 30000; // Check every 30 seconds
 
 setInterval(() => {
@@ -2923,6 +2923,25 @@ setInterval(() => {
     logger.info(`🧹 Heartbeat monitor: Found and cleaned ${staleCallsFound} stale call(s)`);
   }
 }, HEARTBEAT_CHECK_INTERVAL_MS);
+
+// 🔧 CRASH FIX: Additional memory protection - limit max call timers
+const MAX_CONCURRENT_CALLS = 1000;
+setInterval(() => {
+  if (callTimers.size > MAX_CONCURRENT_CALLS) {
+    logger.warn( MEMORY WARNING:  call timers active (max: ));
+    logger.warn(` MEMORY WARNING: ${callTimers.size} call timers active (max: ${MAX_CONCURRENT_CALLS})`);
+    // Find and cleanup oldest timers
+    const sortedTimers = Array.from(callTimers.entries())
+      .sort((a, b) => (a[1].startTime || 0) - (b[1].startTime || 0));
+    
+    const toRemove = sortedTimers.slice(0, callTimers.size - MAX_CONCURRENT_CALLS);
+    toRemove.forEach(([callId, timer]) => {
+      logger.warn( Force cleaning old call timer: );
+      logger.warn(`🧹 Force cleaning old call timer: ${callId}`);
+      callTimers.delete(callId);
+    });
+  }
+}, 60000); // Check every minute
 
 logger.info(`✅ Heartbeat timeout monitor initialized (timeout: ${HEARTBEAT_TIMEOUT_MS / 1000}s, check interval: ${HEARTBEAT_CHECK_INTERVAL_MS / 1000}s)`);
 
