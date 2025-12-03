@@ -1320,7 +1320,8 @@ app.post('/api/start_call_tracking', async (req, res) => {
       recipientId: recipient_id,
       callType: call_type,
       coinRate,
-      roomName: room_name
+      roomName: room_name,
+      lastHeartbeat: Date.now() // 🔧 CRASH FIX: Initialize lastHeartbeat to prevent undefined comparison
     });
 
     logger.info(`⏱️  Started server-side tracking for call ${call_id} (${call_type})`);
@@ -2492,12 +2493,22 @@ io.on('connection', (socket) => {
 
   // 🆕 ISSUE #16 FIX: Handle WebSocket keepalive ping from Flutter during calls
   // This keeps the Socket.IO connection alive on mobile networks
+  // 🔧 CRASH FIX: Also update lastHeartbeat to prevent server-side timeout
   socket.on('call_ping', (data) => {
     const { callId, userId, timestamp } = data;
 
     // Just acknowledge the ping - no heavy processing needed
     // The fact that the message was received keeps the connection alive
     logger.debug(`📡 Call ping received: callId=${callId}, userId=${userId}`);
+
+    // 🔧 CRASH FIX: Update lastHeartbeat on call_ping to prevent 60s timeout
+    if (callId) {
+      const timer = callTimers.get(callId);
+      if (timer) {
+        timer.lastHeartbeat = Date.now();
+        logger.debug(`📡 Updated lastHeartbeat for call ${callId} via call_ping`);
+      }
+    }
 
     // Optionally send pong back (Flutter doesn't need it, but useful for debugging)
     socket.emit('call_pong', {
@@ -2510,11 +2521,20 @@ io.on('connection', (socket) => {
 
   // 🆕 ISSUE #17 FIX: Handle health check ping from Flutter
   // This is used by the WebSocketService health check system to verify connection is alive
+  // 🔧 CRASH FIX: Also update lastHeartbeat for any active call by this user
   socket.on('health_ping', (data) => {
     const { userId, timestamp } = data;
 
     // Lightweight acknowledgment - just proves the socket is alive
     logger.debug(`📡 Health ping received from user: ${userId}`);
+
+    // 🔧 CRASH FIX: Update lastHeartbeat for any active call by this user
+    callTimers.forEach((timer, callId) => {
+      if (timer.callerId === userId || timer.recipientId === userId) {
+        timer.lastHeartbeat = Date.now();
+        logger.debug(`📡 Updated lastHeartbeat for call ${callId} via health_ping from ${userId}`);
+      }
+    });
 
     // Send pong back so Flutter knows the connection is truly alive
     socket.emit('health_pong', {
@@ -2841,15 +2861,26 @@ app.use('*', (req, res) => {
 });
 
 // 🆕 PHASE 1 FIX: Heartbeat timeout monitoring
-// Auto-end calls that haven't received a heartbeat in 60 seconds
-const HEARTBEAT_TIMEOUT_MS = 60000; //  CRASH FIX: Reduced to 60s for faster stale call detection
-const HEARTBEAT_CHECK_INTERVAL_MS = 30000; // Check every 30 seconds
+// 🔧 CRASH FIX: Increased timeout from 60s to 180s (3 minutes) to prevent premature call termination
+// Mobile networks can have brief interruptions, 60s was too aggressive
+const HEARTBEAT_TIMEOUT_MS = 180000; // 3 minutes - more tolerant of network hiccups
+const HEARTBEAT_CHECK_INTERVAL_MS = 60000; // Check every 60 seconds (was 30s)
 
 setInterval(() => {
   const now = Date.now();
   let staleCallsFound = 0;
 
-  callTimers.forEach(async (timer, callId) => {
+  // 🔧 CRASH FIX: Convert to array and use for...of to properly handle async
+  const callEntries = Array.from(callTimers.entries());
+
+  for (const [callId, timer] of callEntries) {
+    // 🔧 CRASH FIX: Handle undefined lastHeartbeat (defensive check)
+    if (!timer.lastHeartbeat) {
+      timer.lastHeartbeat = Date.now();
+      logger.warn(`⚠️ Timer for call ${callId} had no lastHeartbeat, initialized now`);
+      continue;
+    }
+
     const timeSinceLastHeartbeat = now - timer.lastHeartbeat;
 
     if (timeSinceLastHeartbeat > HEARTBEAT_TIMEOUT_MS) {
@@ -2917,7 +2948,7 @@ setInterval(() => {
       // Also clean up from activeCalls
       deleteActiveCallSync(callId);
     }
-  });
+  }
 
   if (staleCallsFound > 0) {
     logger.info(`🧹 Heartbeat monitor: Found and cleaned ${staleCallsFound} stale call(s)`);
@@ -2928,16 +2959,18 @@ setInterval(() => {
 const MAX_CONCURRENT_CALLS = 1000;
 setInterval(() => {
   if (callTimers.size > MAX_CONCURRENT_CALLS) {
-    logger.warn( MEMORY WARNING:  call timers active (max: ));
-    logger.warn(` MEMORY WARNING: ${callTimers.size} call timers active (max: ${MAX_CONCURRENT_CALLS})`);
+    logger.warn(`⚠️ MEMORY WARNING: ${callTimers.size} call timers active (max: ${MAX_CONCURRENT_CALLS})`);
     // Find and cleanup oldest timers
     const sortedTimers = Array.from(callTimers.entries())
       .sort((a, b) => (a[1].startTime || 0) - (b[1].startTime || 0));
-    
+
     const toRemove = sortedTimers.slice(0, callTimers.size - MAX_CONCURRENT_CALLS);
     toRemove.forEach(([callId, timer]) => {
-      logger.warn( Force cleaning old call timer: );
       logger.warn(`🧹 Force cleaning old call timer: ${callId}`);
+      // 🔧 CRASH FIX: Also clear the interval to prevent orphaned timers
+      if (timer.interval) {
+        clearInterval(timer.interval);
+      }
       callTimers.delete(callId);
     });
   }
