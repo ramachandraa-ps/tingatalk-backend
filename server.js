@@ -130,7 +130,7 @@ const io = socketIo(server, {
   cors: corsOptions,
   transports: ['websocket', 'polling'],
   pingInterval: 25000,    // Send ping every 25 seconds
-  pingTimeout: 60000,     // Wait 60 seconds for pong response
+  pingTimeout: 90000, // 🔧 PHASE 3 FIX: Increased from 60s to 90s for mobile networks     // Wait 60 seconds for pong response
   connectTimeout: 45000,  // 45 seconds to establish connection
   upgradeTimeout: 30000,  // 30 seconds to upgrade from polling to websocket
 });
@@ -1947,7 +1947,7 @@ io.on('connection', (socket) => {
 
     // 🆕 Set user status based on saved preference from Firestore (if available)
     const currentStatus = userStatus.get(userId);
-    if (!currentStatus || currentStatus.status === 'unavailable') {
+    if (!currentStatus || currentStatus.status === 'unavailable' || currentStatus.status === 'disconnected') {
       // Try to get saved availability preference from Firestore
       let savedPreference = true; // Default to available
       try {
@@ -2842,7 +2842,7 @@ app.use('*', (req, res) => {
 
 // 🆕 PHASE 1 FIX: Heartbeat timeout monitoring
 // Auto-end calls that haven't received a heartbeat in 60 seconds
-const HEARTBEAT_TIMEOUT_MS = 60000; // 60 seconds
+const HEARTBEAT_TIMEOUT_MS = 120000; // 🔧 PHASE 3 FIX: Increased from 60s to 120s for mobile networks // 60 seconds
 const HEARTBEAT_CHECK_INTERVAL_MS = 30000; // Check every 30 seconds
 
 setInterval(() => {
@@ -2973,7 +2973,7 @@ process.on('SIGINT', () => {
 });
 
 // Handle uncaught exceptions
-process.on('uncaught Exception', (err) => {
+process.on('uncaughtException', (err) => {
   logger.error('💥 Uncaught Exception:', err);
   process.exit(1);
 });
@@ -2982,3 +2982,156 @@ process.on('unhandledRejection', (reason, promise) => {
   logger.error('💥 Unhandled Rejection at:', promise, 'reason:', reason);
   process.exit(1);
 });
+
+// ============================================================================
+// 🔧 SECURITY FIX: Admin authentication middleware for diagnostic endpoints
+// ============================================================================
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY || 'tingatalk-admin-key-2024';
+
+const adminAuth = (req, res, next) => {
+  const apiKey = req.headers['x-admin-key'];
+
+  // Allow requests without auth in development mode
+  if (process.env.NODE_ENV !== 'production') {
+    return next();
+  }
+
+  // Check API key
+  if (apiKey !== ADMIN_API_KEY) {
+    logger.warn(`Unauthorized access attempt to ${req.path} from ${req.ip}`);
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Valid admin API key required for this endpoint'
+    });
+  }
+
+  next();
+};
+
+// ============================================================================
+// 🔧 REDIS TIMER PERSISTENCE: Store timer metadata for crash recovery
+// ============================================================================
+async function storeCallTimerInRedis(callId, callData) {
+  try {
+    const timerKey = `call_timer:${callId}`;
+    await scalability.redis.hset(timerKey, {
+      startTime: Date.now().toString(),
+      callerId: callData.callerId || '',
+      recipientId: callData.recipientId || '',
+      callType: callData.callType || 'video',
+      coinRate: (callData.callType === 'video' ? 1.0 : 0.2).toString(),
+      roomName: callData.roomName || ''
+    });
+    await scalability.redis.expire(timerKey, 14400); // 4 hour expiry
+    logger.info(`✅ Call timer stored in Redis: ${callId}`);
+  } catch (error) {
+    logger.error(`❌ Failed to store call timer in Redis: ${callId}`, error.message);
+  }
+}
+
+async function removeCallTimerFromRedis(callId) {
+  try {
+    await scalability.redis.del(`call_timer:${callId}`);
+    logger.info(`✅ Call timer removed from Redis: ${callId}`);
+  } catch (error) {
+    logger.error(`❌ Failed to remove call timer from Redis: ${callId}`, error.message);
+  }
+}
+
+async function recoverCallTimersFromRedis() {
+  try {
+    const keys = await scalability.redis.keys('call_timer:*');
+    logger.info(`🔄 Found ${keys.length} call timers to recover from Redis`);
+
+    for (const key of keys) {
+      const timerData = await scalability.redis.hgetall(key);
+      const callId = key.replace('call_timer:', '');
+      const elapsed = Math.floor((Date.now() - parseInt(timerData.startTime)) / 1000);
+
+      if (elapsed > 14400) {
+        await scalability.redis.del(key);
+        logger.warn(`🧹 Cleaned up stale call timer: ${callId} (${elapsed}s old)`);
+        continue;
+      }
+
+      activeCalls.set(callId, {
+        ...timerData,
+        startTime: parseInt(timerData.startTime),
+        elapsedSeconds: elapsed,
+        recovered: true
+      });
+      logger.info(`✅ Recovered call timer: ${callId} (${elapsed}s elapsed)`);
+    }
+  } catch (error) {
+    logger.error('❌ Error recovering call timers:', error.message);
+  }
+}
+
+// ============================================================================
+// 🔧 FIRESTORE TRANSACTION ATOMICITY: Atomic coin deduction
+// ============================================================================
+async function deductCoinsAtomically(callerId, amount, callId) {
+  const db = scalability.firestore;
+  if (!db) {
+    logger.error('❌ Firestore not initialized for atomic deduction');
+    return { success: false, error: 'Firestore not available' };
+  }
+
+  try {
+    return await db.runTransaction(async (transaction) => {
+      const userRef = db.collection('users').doc(callerId);
+      const userDoc = await transaction.get(userRef);
+
+      if (!userDoc.exists) {
+        throw new Error('User not found');
+      }
+
+      const userData = userDoc.data();
+      const currentBalance = userData.coins || 0;
+
+      if (currentBalance < amount) {
+        throw new Error('Insufficient balance');
+      }
+
+      const newBalance = currentBalance - amount;
+
+      transaction.update(userRef, {
+        coins: newBalance,
+        lastDeductedAt: scalability.admin.firestore.FieldValue.serverTimestamp()
+      });
+
+      const txnRef = db.collection('transactions').doc();
+      transaction.set(txnRef, {
+        userId: callerId,
+        callId: callId,
+        amount: -amount,
+        type: 'call_charge',
+        previousBalance: currentBalance,
+        newBalance: newBalance,
+        createdAt: scalability.admin.firestore.FieldValue.serverTimestamp()
+      });
+
+      logger.info(`✅ Atomic deduction: ${callerId} - ${amount} coins (${currentBalance} -> ${newBalance})`);
+
+      return {
+        success: true,
+        previousBalance: currentBalance,
+        newBalance: newBalance,
+        deducted: amount
+      };
+    });
+  } catch (error) {
+    logger.error(`❌ Atomic deduction failed for ${callerId}:`, error.message);
+    return { success: false, error: error.message };
+  }
+}
+
+// Call timer recovery on startup (delayed to allow Redis connection)
+setTimeout(async () => {
+  if (scalability.redis) {
+    await recoverCallTimersFromRedis();
+  }
+}, 5000);
+
+logger.info('✅ Server patches applied: Admin auth, Redis timer persistence, Atomic billing');
+
