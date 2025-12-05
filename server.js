@@ -1113,21 +1113,21 @@ app.get('/api/get_available_females', async (req, res) => {
         logger.info(`📋   - Socket connected: ${isSocketConnected}`);
       }
 
-      // 🔧 RESTORED ORIGINAL LOGIC: ONLY show users with active WebSocket connection
-      // User MUST have active WebSocket to appear in browse list
-      // If app is closed (even with toggle ON), user should NOT appear
-      if (!isSocketConnected) {
-        logger.info(`📋 Skipping user ${userId} (${userData.name}) - no active WebSocket connection`);
-        continue;
-      }
+      // 🔧 FIX: Show females based on TOGGLE (isAvailable), not WebSocket connection
+      // Toggle ON = user wants to be visible, even if app is in background
+      // WebSocket status only affects the online/offline indicator, not visibility
 
-      logger.info(`📋   - User has active WebSocket connection - AVAILABLE`);
-
-      // Also verify isAvailable is true in Firestore (toggle is ON)
+      // Verify isAvailable is true in Firestore (toggle is ON)
       if (userData.isAvailable !== true) {
-        logger.info(`📋 Skipping user ${userId} (${userData.name}) - isAvailable is not true`);
+        logger.info(`📋 Skipping user ${userId} (${userData.name}) - isAvailable (toggle) is not true`);
         continue;
       }
+
+      logger.info(`📋   - User has toggle ON (isAvailable=true) - WILL BE SHOWN`);
+      logger.info(`📋   - User online status: ${isSocketConnected ? 'ONLINE (WebSocket connected)' : 'OFFLINE (background/disconnected)'}`);
+
+      // Store the actual online status for UI to display
+      const actualOnlineStatus = isSocketConnected;
 
       // Check if user is not currently on a call
       const userStatusData = userStatus.get(userId);
@@ -1206,15 +1206,15 @@ app.get('/api/get_available_females', async (req, res) => {
       }
 
       // STEP 4: Build user object with all required fields
-      // 🔧 RESTORED: Only WebSocket-connected users reach this point
+      // 🔧 FIX: Include actual online status for UI to show proper indicator
       const userObject = {
         userId: userId,
         name: userData.name || 'Unknown',
         age: userData.age || 0,
         photoUrl: userData.photoUrl || '',
         fullPhotoUrl: userData.fullPhotoUrl || userData.photoUrl || '',
-        isOnline: true, // Always true - only WebSocket-connected users reach here
-        isAvailable: true, // Always true - filtered by Firestore isAvailable earlier
+        isOnline: actualOnlineStatus, // 🔧 FIX: Use actual WebSocket status, not always true
+        isAvailable: true, // Always true - filtered by Firestore isAvailable (toggle) earlier
         rating: powerUpStats.rating,
         totalCalls: powerUpStats.totalCalls,
         totalLikes: powerUpStats.totalLikes,
@@ -2054,6 +2054,24 @@ io.on('connection', (socket) => {
           logger.info(`📞 Fixed missing status for recipient ${recipientId} - set to available`);
         }
       }
+    }
+
+    // 🔧 FIX: EXPLICIT BUSY/RINGING CHECK - Must be done FIRST before any other checks
+    // This prevents second caller from reaching a female who is already on a call
+    if (recipientStatus && (recipientStatus.status === 'busy' || recipientStatus.status === 'ringing')) {
+      logger.warn(`📞 ❌ CALL BLOCKED: Recipient ${recipientId} is ${recipientStatus.status}`);
+      logger.warn(`📞    Current call ID: ${recipientStatus.currentCallId || 'unknown'}`);
+      logger.warn(`📞    Caller ${callerId} will receive call_failed event`);
+
+      socket.emit('call_failed', {
+        callId: callId || `call_${Date.now()}`,
+        reason: recipientStatus.status === 'busy'
+          ? 'User is busy on another call'
+          : 'User is receiving another call',
+        recipient_status: recipientStatus.status,
+        is_busy: true
+      });
+      return;
     }
 
     // 🔧 NEW: Check if user has toggle ON in Firestore (even without WebSocket)
