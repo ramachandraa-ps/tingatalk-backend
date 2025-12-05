@@ -239,23 +239,23 @@ function startDisconnectTimeout(userId, userType) {
         return;
       }
 
-      // Update Firestore to mark user as unavailable
+      // Update Firestore - ONLY update isOnline, preserve isAvailable (toggle)
+      // FIX: isAvailable is user's PREFERENCE (toggle) - should NOT change on disconnect timeout
+      // Toggle should only turn OFF when: user manually turns it off, force closes app, or logs out
       const db = scalability.firestore;
       if (db) {
         await db.collection('users').doc(userId).update({
-          isAvailable: false,
-          isOnline: false,
+          // isAvailable: false, // REMOVED - Don't change toggle on disconnect timeout
+          isOnline: false,       // Only change connection status
           lastSeenAt: new Date(),
-          unavailableReason: 'disconnect_timeout',
           disconnectedAt: new Date(),
         });
-        logger.info(`✅ User ${userId} marked as unavailable in Firestore (disconnect timeout)`);
+        logger.info(`✅ User ${userId} - isOnline set to FALSE (toggle preserved, disconnect timeout)`);
 
-        // Also emit event to notify any connected clients about availability change
-        io.emit('availability_changed', {
+        // Emit status_changed instead of availability_changed
+        io.emit('user_status_changed', {
           femaleUserId: userId,
-          isAvailable: false,
-          status: 'unavailable',
+          isOnline: false,
           reason: 'disconnect_timeout',
           timestamp: new Date().toISOString(),
         });
@@ -2807,25 +2807,28 @@ io.on('connection', (socket) => {
             reason: 'websocket_disconnect'
           });
 
-          // 2. IMMEDIATELY update Firestore isAvailable to false
-          // This is CRITICAL: when female reopens app, she should NOT appear until toggle is turned ON
+          // 2. Update Firestore - ONLY set isOnline to false, preserve isAvailable (toggle)
+          // FIX: isAvailable is the user's PREFERENCE (toggle) - should NOT change on disconnect
+          // isOnline is the CONNECTION STATUS - should change on disconnect
+          // The toggle should only turn OFF when: user manually turns it off, force closes app, or logs out
           try {
             const db = scalability.firestore;
             if (db) {
               await db.collection('users').doc(userId).update({
-                isAvailable: false,
-                isOnline: false,
+                // isAvailable: false, // REMOVED - Don't change toggle on background/disconnect
+                isOnline: false,       // Only change connection status
                 lastSeenAt: new Date(),
-                disconnectedAt: new Date(),
-                unavailableReason: 'app_closed'
+                disconnectedAt: new Date()
+                // unavailableReason removed - toggle is still ON
               });
-              logger.info(`✅ Female user ${userId} - isAvailable set to FALSE in Firestore IMMEDIATELY`);
+              logger.info(`✅ Female user ${userId} - isOnline set to FALSE (toggle preserved)`);
 
-              // Also emit availability_changed for any other listeners
-              io.emit('availability_changed', {
+              // Emit status_changed instead of availability_changed
+              // This tells males the female is offline but toggle is still ON
+              io.emit('user_status_changed', {
                 femaleUserId: userId,
-                isAvailable: false,
-                status: 'unavailable',
+                isOnline: false,
+                // isAvailable is NOT included - males should check Firestore for current toggle state
                 reason: 'disconnect',
                 timestamp: new Date().toISOString()
               });
