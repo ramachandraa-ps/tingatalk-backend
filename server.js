@@ -944,8 +944,7 @@ app.post('/api/check_call_status', async (req, res) => {
 // 🆕 PRODUCTION ENDPOINT: Update user availability status (for female users)
 app.post('/api/update_availability', async (req, res) => {
   try {
-    // 🔧 FIX: Also accept is_online for complete offline (logout/force-close)
-    const { user_id, is_available, is_online, reason } = req.body;
+    const { user_id, is_available } = req.body;
 
     if (!user_id || typeof is_available !== 'boolean') {
       return res.status(400).json({
@@ -954,19 +953,13 @@ app.post('/api/update_availability', async (req, res) => {
       });
     }
 
-    // Determine if this is a complete offline request (logout/force-close)
-    const isCompleteOffline = is_available === false && is_online === false;
-
-    logger.info(`📱 Availability update request - User: ${user_id}, Available: ${is_available}, Online: ${is_online}, Reason: ${reason || 'not specified'}`);
-    if (isCompleteOffline) {
-      logger.info(`📱 🔴 Complete offline request detected (logout/force-close)`);
-    }
+    logger.info(`📱 Availability update request - User: ${user_id}, Available: ${is_available}`);
 
     // Get current user status
     const currentStatus = userStatus.get(user_id);
 
-    // Check if user is currently on a call (only block if not a force-close)
-    if (currentStatus && currentStatus.status === 'busy' && !is_available && reason !== 'app_terminated') {
+    // Check if user is currently on a call
+    if (currentStatus && currentStatus.status === 'busy' && !is_available) {
       logger.warn(`⚠️ User ${user_id} is on a call, cannot set unavailable`);
       return res.status(400).json({
         success: false,
@@ -988,31 +981,17 @@ app.post('/api/update_availability', async (req, res) => {
     logger.info(`✅ User ${user_id} availability updated to: ${newStatus}`);
 
     // Update Firestore to persist availability preference
-    // 🔧 FIX: Also update isOnline if provided
     try {
       const userDoc = scalability.firestore.collection('users').doc(user_id);
-      const updateData = {
+      await userDoc.set({
         isAvailable: is_available,
         lastAvailabilityUpdate: new Date(),
         updatedAt: new Date()
-      };
+      }, { merge: true });
 
-      // If is_online is explicitly provided, update it too
-      if (typeof is_online === 'boolean') {
-        updateData.isOnline = is_online;
-        logger.info(`📱 Also setting isOnline to ${is_online} for user ${user_id}`);
-      }
-
-      // If this is a logout/force-close, add timestamp
-      if (reason === 'app_terminated') {
-        updateData.appTerminatedAt = new Date();
-      }
-
-      await userDoc.set(updateData, { merge: true });
-
-      logger.info(`💾 User status saved to Firestore for user ${user_id}: isAvailable=${is_available}, isOnline=${is_online}`);
+      logger.info(`💾 Availability preference saved to Firestore for user ${user_id}`);
     } catch (firestoreError) {
-      logger.error(`❌ Failed to save status to Firestore: ${firestoreError.message}`);
+      logger.error(`❌ Failed to save availability to Firestore: ${firestoreError.message}`);
       // Continue even if Firestore update fails - status is updated in memory/Redis
     }
 
