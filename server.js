@@ -184,7 +184,10 @@ const callTimers = new Map(); // callId -> { interval, startTime, durationSecond
 // 🆕 DISCONNECT TIMEOUT: Auto-mark users unavailable after disconnect
 // When user disconnects, start a timer. If they don't reconnect within timeout, set isAvailable=false
 const disconnectTimeouts = new Map(); // userId -> { timeoutId, disconnectedAt, userType }
-const DISCONNECT_TIMEOUT_MS = 30000; // 30 seconds timeout before marking unavailable
+// 🔧 FORCE-CLOSE FIX: Reduced from 30s to 15s for faster force-close detection
+// Flutter health check runs every 10s, so 15s timeout gives enough buffer for reconnection
+// but detects force-close faster (15s instead of 30s)
+const DISCONNECT_TIMEOUT_MS = 15000; // 15 seconds timeout before marking unavailable
 
 // ============================================================================
 // 🆕 REDIS + FIRESTORE WRAPPERS (Non-blocking, Cluster-Safe)
