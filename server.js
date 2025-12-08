@@ -239,46 +239,26 @@ function startDisconnectTimeout(userId, userType) {
         return;
       }
 
-      // 🔧 FORCE-CLOSE FIX: If user hasn't reconnected after timeout, it means they force-closed the app
-      // In this case, set BOTH isOnline AND isAvailable to false for female users
-      // This prevents "ghost" cards from appearing on the male side
+      // Update Firestore - ONLY update isOnline, preserve isAvailable (toggle)
+      // FIX: isAvailable is user's PREFERENCE (toggle) - should NOT change on disconnect timeout
+      // Toggle should only turn OFF when: user manually turns it off, force closes app, or logs out
       const db = scalability.firestore;
       if (db) {
-        if (userType === 'female') {
-          // Female user force-closed: Set BOTH fields to false
-          await db.collection('users').doc(userId).update({
-            isAvailable: false,  // Turn off toggle - user force-closed app
-            isOnline: false,     // User is offline
-            lastSeenAt: new Date(),
-            disconnectedAt: new Date(),
-            forceClosedAt: new Date(),  // Track when force-close was detected
-          });
-          logger.info(`✅ Female user ${userId} - BOTH isAvailable AND isOnline set to FALSE (force-close detected)`);
+        await db.collection('users').doc(userId).update({
+          // isAvailable: false, // REMOVED - Don't change toggle on disconnect timeout
+          isOnline: false,       // Only change connection status
+          lastSeenAt: new Date(),
+          disconnectedAt: new Date(),
+        });
+        logger.info(`✅ User ${userId} - isOnline set to FALSE (toggle preserved, disconnect timeout)`);
 
-          // Emit availability_changed so males remove the card immediately
-          io.emit('availability_changed', {
-            femaleUserId: userId,
-            isAvailable: false,
-            isOnline: false,
-            reason: 'force_close_detected',
-            timestamp: new Date().toISOString(),
-          });
-        } else {
-          // Male or unknown user: Only set isOnline to false
-          await db.collection('users').doc(userId).update({
-            isOnline: false,
-            lastSeenAt: new Date(),
-            disconnectedAt: new Date(),
-          });
-          logger.info(`✅ User ${userId} - isOnline set to FALSE (disconnect timeout)`);
-
-          io.emit('user_status_changed', {
-            userId: userId,
-            isOnline: false,
-            reason: 'disconnect_timeout',
-            timestamp: new Date().toISOString(),
-          });
-        }
+        // Emit status_changed instead of availability_changed
+        io.emit('user_status_changed', {
+          femaleUserId: userId,
+          isOnline: false,
+          reason: 'disconnect_timeout',
+          timestamp: new Date().toISOString(),
+        });
       } else {
         logger.error(`❌ Firestore not available - cannot update user ${userId}`);
       }
