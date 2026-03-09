@@ -208,12 +208,14 @@ const limiter = rateLimit({
 });
 app.use('/api/', limiter);
 
-// Apply Firebase auth to financial and call endpoints
+// Apply Firebase auth to financial, call, and token endpoints
 app.use('/api/payments', verifyFirebaseToken);
 app.use('/api/rewards', verifyFirebaseToken);
 app.use('/api/calls', verifyFirebaseToken);
 app.use('/api/validate_balance', verifyFirebaseToken);
 app.use('/api/user', verifyFirebaseToken);
+app.use('/api/generate_token', verifyFirebaseToken);
+app.use('/api/check_call_status', verifyFirebaseToken);
 
 // ============================================================================
 // PRODUCTION ENHANCEMENTS: Call State Management
