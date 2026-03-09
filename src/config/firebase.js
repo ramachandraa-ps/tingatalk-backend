@@ -2,8 +2,12 @@ import admin from 'firebase-admin';
 import { config } from './index.js';
 import { createRequire } from 'module';
 import { logger } from '../utils/logger.js';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 const require = createRequire(import.meta.url);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const projectRoot = path.resolve(__dirname, '../../');
 
 let firestore = null;
 let messaging = null;
@@ -18,7 +22,11 @@ export async function initFirebase() {
     }
 
     if (config.firebase.serviceAccountPath) {
-      const serviceAccount = require(config.firebase.serviceAccountPath);
+      // Resolve relative paths from project root (not from src/config/)
+      const resolvedPath = path.isAbsolute(config.firebase.serviceAccountPath)
+        ? config.firebase.serviceAccountPath
+        : path.resolve(projectRoot, config.firebase.serviceAccountPath);
+      const serviceAccount = require(resolvedPath);
       admin.initializeApp({
         credential: admin.credential.cert(serviceAccount),
         projectId: config.firebase.projectId

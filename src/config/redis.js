@@ -11,25 +11,35 @@ export async function initRedis() {
   const redisConfig = {
     host: config.redis.host,
     port: config.redis.port,
-    password: config.redis.password,
-    retryStrategy: (times) => Math.min(times * 50, 2000),
+    password: config.redis.password || undefined,
+    retryStrategy: (times) => {
+      if (times > 3) {
+        logger.warn('Redis max retries reached — running without Redis');
+        return null; // stop retrying
+      }
+      return Math.min(times * 50, 2000);
+    },
     maxRetriesPerRequest: 3,
-    lazyConnect: false
+    lazyConnect: true
   };
 
-  redis = new Redis(redisConfig);
-  redisPub = new Redis(redisConfig);
-  redisSub = redisPub.duplicate();
-
-  redis.on('connect', () => logger.info('Redis connected successfully'));
-  redis.on('error', (err) => logger.error('Redis error:', err.message));
-  redis.on('ready', () => logger.info('Redis ready to accept commands'));
-
   try {
+    redis = new Redis(redisConfig);
+    redisPub = new Redis(redisConfig);
+    redisSub = redisPub.duplicate();
+
+    redis.on('connect', () => logger.info('Redis connected successfully'));
+    redis.on('error', (err) => logger.error('Redis error:', err.message));
+    redis.on('ready', () => logger.info('Redis ready to accept commands'));
+
+    await redis.connect();
     await redis.ping();
     logger.info('Redis PING successful');
   } catch (error) {
-    logger.error('Redis PING failed:', error.message);
+    logger.warn(`Redis not available: ${error.message} — running without Redis`);
+    redis = null;
+    redisPub = null;
+    redisSub = null;
   }
 }
 

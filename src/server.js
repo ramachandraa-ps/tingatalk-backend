@@ -15,7 +15,7 @@ import { COIN_RATES, MIN_BALANCE } from './shared/constants.js';
 
 async function main() {
   // 1. Initialize infrastructure
-  initFirebase();
+  await initFirebase();
   await initRedis();
 
   // 2. Create Express app
