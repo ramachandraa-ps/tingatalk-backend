@@ -10,6 +10,7 @@ const crypto = require('crypto');
 const Razorpay = require('razorpay');
 const axios = require('axios');
 require('dotenv').config();
+const admin = require('firebase-admin');
 // ============================================================================
 // SCALABILITY: Redis + PostgreSQL + Clustering Support
 // ============================================================================
@@ -77,13 +78,14 @@ const twilio = require('twilio');
 const AccessToken = twilio.jwt.AccessToken;
 const VideoGrant = AccessToken.VideoGrant;
 
-// Razorpay configuration
-const razorpayKeyId = process.env.RAZORPAY_KEY_ID || 'rzp_test_8DmfRFT3ZEhV7F';
-const razorpayKeySecret = process.env.RAZORPAY_KEY_SECRET || 'UgQXen8uDJ3QeGVsLQBMM1ar';
-const razorpayAccountNumber = process.env.RAZORPAYX_ACCOUNT_NUMBER || '2323230076543210';
+// Razorpay configuration — credentials MUST come from environment
+const razorpayKeyId = process.env.RAZORPAY_KEY_ID;
+const razorpayKeySecret = process.env.RAZORPAY_KEY_SECRET;
+const razorpayAccountNumber = process.env.RAZORPAYX_ACCOUNT_NUMBER || '';
 
 if (!razorpayKeyId || !razorpayKeySecret) {
-  logger.error('❌ Missing Razorpay credentials. Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET.');
+  logger.error('❌ FATAL: Missing Razorpay credentials. Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET in .env');
+  process.exit(1);
 }
 
 const razorpayClient = new Razorpay({
@@ -107,13 +109,52 @@ function verifyPaymentSignature(orderId, paymentId, signature) {
   return digest === signature;
 }
 
+// ============================================================================
+// Firebase Auth Middleware — verify ID tokens from Flutter app
+// ============================================================================
+const verifyFirebaseToken = async (req, res, next) => {
+  // Skip auth for health and public endpoints
+  const publicPaths = ['/api/health', '/api/packages'];
+  if (publicPaths.some(p => req.path.startsWith(p))) {
+    return next();
+  }
+
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Missing or invalid authorization header' });
+  }
+
+  try {
+    const idToken = authHeader.split('Bearer ')[1];
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    req.authenticatedUserId = decodedToken.uid;
+    next();
+  } catch (error) {
+    logger.warn(`🔒 Auth failed: ${error.message}`);
+    return res.status(401).json({ error: 'Invalid or expired auth token' });
+  }
+};
+
 // Create Express app
 const app = express();
 const server = http.createServer(app);
 
 // CORS configuration - Production ready with environment-based origins
 const corsOptions = {
-  origin: process.env.CORS_ORIGIN === '*' ? true : process.env.CORS_ORIGIN?.split(',').map(origin => origin.trim()) || true,
+  origin: function (origin, callback) {
+    // Allow requests with no origin (mobile apps, server-to-server)
+    if (!origin) return callback(null, true);
+
+    const allowedOrigins = process.env.CORS_ORIGIN
+      ? process.env.CORS_ORIGIN.split(',').map(o => o.trim())
+      : ['https://api.tingatalk.in', 'https://tingatalk.in'];
+
+    if (allowedOrigins.includes(origin) || allowedOrigins.includes('*')) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
@@ -166,6 +207,13 @@ const limiter = rateLimit({
   message: 'Too many requests from this IP, please try again later.'
 });
 app.use('/api/', limiter);
+
+// Apply Firebase auth to financial and call endpoints
+app.use('/api/payments', verifyFirebaseToken);
+app.use('/api/rewards', verifyFirebaseToken);
+app.use('/api/calls', verifyFirebaseToken);
+app.use('/api/validate_balance', verifyFirebaseToken);
+app.use('/api/user', verifyFirebaseToken);
 
 // ============================================================================
 // PRODUCTION ENHANCEMENTS: Call State Management
@@ -352,6 +400,16 @@ const MIN_CALL_DURATION_SECONDS = 120;
 const MIN_BALANCE_AUDIO = COIN_RATES.audio * MIN_CALL_DURATION_SECONDS;  // 24 coins
 const MIN_BALANCE_VIDEO = COIN_RATES.video * MIN_CALL_DURATION_SECONDS;  // 120 coins
 
+// ============================================================================
+// COIN PACKAGES — Server-authoritative pricing
+// ============================================================================
+const COIN_PACKAGES = {
+  'starter_pack': { id: 'starter_pack', name: 'Starter Pack', coinAmount: 100, priceInRupees: 99, discountPercent: 10, isPopular: false, isActive: true },
+  'popular_pack': { id: 'popular_pack', name: 'Popular Pack', coinAmount: 500, priceInRupees: 399, discountPercent: 20, isPopular: true, isActive: true },
+  'value_pack': { id: 'value_pack', name: 'Value Pack', coinAmount: 1000, priceInRupees: 699, discountPercent: 30, isPopular: false, isActive: true },
+  'premium_pack': { id: 'premium_pack', name: 'Premium Pack', coinAmount: 2500, priceInRupees: 1499, discountPercent: 25, isPopular: false, isActive: true },
+};
+
 // Twilio credentials
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
 const apiKeySid = process.env.TWILIO_API_KEY_SID;
@@ -446,8 +504,176 @@ app.get('/api/health', async (req, res) => {
   });
 });
 
+// Get available coin packages (public endpoint — no auth required)
+app.get('/api/packages', (req, res) => {
+  const activePackages = Object.values(COIN_PACKAGES).filter(p => p.isActive);
+  res.json({ packages: activePackages });
+});
+
+// ============================================================================
+// DAILY REWARDS — Server-authoritative
+// ============================================================================
+const DAILY_REWARD_COINS = 10;
+
+app.post('/api/rewards/daily-claim', async (req, res) => {
+  try {
+    const userId = req.authenticatedUserId;
+    if (!userId) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+
+    const userRef = scalability.firestore.collection('users').doc(userId);
+    const userDoc = await userRef.get();
+
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const userData = userDoc.data();
+    const lastRewardAt = userData.lastDailyRewardAt;
+    const currentStreak = userData.currentStreak || 0;
+    const highestStreak = userData.highestStreak || 0;
+
+    // Use server time for eligibility check
+    const now = new Date();
+    const todayMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+    let nextStreak = 1;
+    let streakBroken = false;
+    let isFirstTime = false;
+
+    if (!lastRewardAt) {
+      isFirstTime = true;
+      nextStreak = 1;
+    } else {
+      const lastDate = lastRewardAt.toDate ? lastRewardAt.toDate() : new Date(lastRewardAt);
+      const lastMidnight = new Date(lastDate.getFullYear(), lastDate.getMonth(), lastDate.getDate());
+
+      if (lastMidnight.getTime() === todayMidnight.getTime()) {
+        return res.status(400).json({
+          error: 'Already claimed today',
+          nextClaimTime: new Date(todayMidnight.getTime() + 86400000).toISOString(),
+        });
+      }
+
+      const yesterdayMidnight = new Date(todayMidnight.getTime() - 86400000);
+      if (lastMidnight.getTime() === yesterdayMidnight.getTime()) {
+        nextStreak = currentStreak + 1;
+      } else {
+        streakBroken = currentStreak > 0;
+        nextStreak = 1;
+      }
+    }
+
+    const transactionId = `daily_reward_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`;
+    const txnData = {
+      id: transactionId,
+      userId,
+      type: 'bonus',
+      status: 'success',
+      coinAmount: DAILY_REWARD_COINS,
+      description: 'Daily reward claimed',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      metadata: {
+        rewardType: 'daily_reward',
+        claimDate: todayMidnight.toISOString(),
+        streak: nextStreak,
+        streakBroken,
+        isFirstTime,
+      },
+    };
+
+    const updateData = {
+      coins: admin.firestore.FieldValue.increment(DAILY_REWARD_COINS),
+      lastDailyRewardAt: admin.firestore.FieldValue.serverTimestamp(),
+      totalDailyRewardsCollected: admin.firestore.FieldValue.increment(1),
+      currentStreak: nextStreak,
+      lastActiveAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+    if (nextStreak > highestStreak) {
+      updateData.highestStreak = nextStreak;
+    }
+
+    try {
+      await scalability.firestore.runTransaction(async (t) => {
+        // Re-read user data inside transaction for atomicity
+        const freshUserDoc = await t.get(userRef);
+        const freshData = freshUserDoc.data();
+        const freshLastReward = freshData.lastDailyRewardAt;
+
+        // Double-check eligibility inside transaction
+        if (freshLastReward) {
+          const lastDate = freshLastReward.toDate ? freshLastReward.toDate() : new Date(freshLastReward);
+          const lastMidnight = new Date(lastDate.getFullYear(), lastDate.getMonth(), lastDate.getDate());
+          if (lastMidnight.getTime() === todayMidnight.getTime()) {
+            throw new Error('ALREADY_CLAIMED');
+          }
+        }
+
+        t.set(
+          scalability.firestore.collection('users').doc(userId).collection('transactions').doc(transactionId),
+          txnData
+        );
+        t.set(
+          scalability.firestore.collection('transactions').doc(transactionId),
+          { ...txnData, userDisplayName: userData.name || 'Unknown', userGender: userData.gender || 'unknown' }
+        );
+        t.update(userRef, updateData);
+      });
+    } catch (txnError) {
+      if (txnError.message === 'ALREADY_CLAIMED') {
+        return res.status(400).json({
+          error: 'Already claimed today',
+          nextClaimTime: new Date(todayMidnight.getTime() + 86400000).toISOString(),
+        });
+      }
+      throw txnError; // Re-throw other errors
+    }
+
+    const newBalance = await scalability.getUserBalance(userId);
+
+    logger.info(`🎁 Daily reward claimed: ${DAILY_REWARD_COINS} coins for user ${userId}, streak: ${nextStreak}`);
+
+    res.json({
+      success: true,
+      coinsCredited: DAILY_REWARD_COINS,
+      transactionId,
+      currentStreak: nextStreak,
+      highestStreak: Math.max(nextStreak, highestStreak),
+      streakBroken,
+      isFirstTime,
+      newBalance,
+      nextClaimTime: new Date(todayMidnight.getTime() + 86400000).toISOString(),
+    });
+
+  } catch (error) {
+    logger.error('❌ Error claiming daily reward:', error);
+    res.status(500).json({ error: 'Failed to claim daily reward' });
+  }
+});
+
+// ============================================================================
+// 🔧 SECURITY FIX: Admin authentication middleware for diagnostic endpoints
+// ============================================================================
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
+if (!ADMIN_API_KEY) {
+  logger.warn('⚠️ No ADMIN_API_KEY set — admin endpoints will reject all requests in production');
+}
+
+const adminAuth = (req, res, next) => {
+  const apiKey = req.headers['x-admin-api-key'];
+  if (!ADMIN_API_KEY) {
+    return res.status(503).json({ error: 'Admin API key not configured' });
+  }
+  if (apiKey !== ADMIN_API_KEY) {
+    return res.status(403).json({ error: 'Invalid admin API key' });
+  }
+  next();
+};
+
 // 🆕 DIAGNOSTIC ENDPOINT: Check Socket.IO connections and rooms
-app.get('/api/diagnostic/connections', (req, res) => {
+app.get('/api/diagnostic/connections', adminAuth, (req, res) => {
   try {
     const diagnostics = {
       timestamp: new Date().toISOString(),
@@ -516,7 +742,7 @@ app.get('/api/diagnostic/connections', (req, res) => {
 });
 
 // 🆕 DIAGNOSTIC ENDPOINT: Check specific user connection
-app.get('/api/diagnostic/user/:userId', (req, res) => {
+app.get('/api/diagnostic/user/:userId', adminAuth, (req, res) => {
   try {
     const { userId } = req.params;
     
@@ -561,12 +787,18 @@ app.get('/api/diagnostic/user/:userId', (req, res) => {
 // Razorpay - create order for checkout
 app.post('/api/payments/orders', async (req, res) => {
   try {
-    const { amount, currency = 'INR', userId, userName, packageId, coins, receipt, notes } = req.body;
-    if (!amount || !userId || !packageId) {
-      return res.status(400).json({ error: 'amount, userId and packageId are required' });
+    const { currency = 'INR', userName, packageId, coins, receipt, notes } = req.body;
+    const userId = req.authenticatedUserId;
+    if (!userId || !packageId) {
+      return res.status(400).json({ error: 'userId and packageId are required' });
     }
 
-    const amountInPaise = Math.round(Number(amount) * 100);
+    // Server-authoritative pricing — look up from package registry
+    const coinPackage = COIN_PACKAGES[packageId];
+    if (!coinPackage) {
+      return res.status(400).json({ error: `Unknown packageId: ${packageId}` });
+    }
+    const amountInPaise = Math.round(coinPackage.priceInRupees * 100);
     const order = await razorpayClient.orders.create({
       amount: amountInPaise,
       currency,
@@ -594,28 +826,171 @@ app.post('/api/payments/orders', async (req, res) => {
 });
 
 // Razorpay - verify payment signature
-app.post('/api/payments/verify', (req, res) => {
+// Razorpay - verify payment signature AND credit coins (server-authoritative)
+app.post('/api/payments/verify', async (req, res) => {
   try {
-    const { orderId, paymentId, signature, userId } = req.body;
+    const { orderId, paymentId, signature } = req.body;
+    const userId = req.authenticatedUserId;
+
     if (!orderId || !paymentId || !signature) {
       return res.status(400).json({ error: 'orderId, paymentId and signature are required' });
     }
 
+    // Step 1: Verify Razorpay signature
     const isValid = verifyPaymentSignature(orderId, paymentId, signature);
     if (!isValid) {
       return res.status(400).json({ error: 'Invalid payment signature' });
     }
 
+    // Step 2: Check for duplicate — idempotency
+    const existingVerification = await scalability.firestore
+      .collection('payment_verifications')
+      .doc(orderId)
+      .get();
+
+    if (existingVerification.exists) {
+      const existing = existingVerification.data();
+      logger.warn(`⚠️ Duplicate verification attempt for order ${orderId}`);
+      return res.json({
+        isValid: true,
+        verificationId: existing.verificationId,
+        paymentId: existing.paymentId,
+        coinsCredited: existing.coinsCredited,
+        newBalance: existing.newBalance,
+        verifiedAt: existing.verifiedAt,
+        duplicate: true,
+      });
+    }
+
+    // Step 3: Look up the Razorpay order to get the packageId from notes
+    let packageId;
+    try {
+      const razorpayOrder = await razorpayClient.orders.fetch(orderId);
+      packageId = razorpayOrder.notes?.packageId;
+    } catch (fetchError) {
+      logger.error(`❌ Failed to fetch Razorpay order ${orderId}:`, fetchError);
+      return res.status(500).json({ error: 'Failed to fetch order details from Razorpay' });
+    }
+
+    if (!packageId || !COIN_PACKAGES[packageId]) {
+      return res.status(400).json({ error: `Invalid or unknown packageId: ${packageId}` });
+    }
+
+    const coinPackage = COIN_PACKAGES[packageId];
     const verificationId = `ver_${Date.now()}`;
+    const verifiedAt = new Date().toISOString();
+
+    // Step 4: Atomic Firestore transaction — credit coins + record transaction
+    const userRef = scalability.firestore.collection('users').doc(userId);
+    const transactionId = `txn_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`;
+
+    const transactionData = {
+      id: transactionId,
+      userId: userId,
+      type: 'purchase',
+      status: 'success',
+      coinAmount: coinPackage.coinAmount,
+      priceInRupees: coinPackage.priceInRupees,
+      packageId: coinPackage.id,
+      paymentGatewayId: paymentId,
+      paymentMethod: 'razorpay',
+      description: `Purchased ${coinPackage.name} - ${coinPackage.coinAmount} coins`,
+      createdAt: verifiedAt,
+      updatedAt: verifiedAt,
+      metadata: {
+        verificationId,
+        orderId,
+        paymentSignature: signature,
+        purchaseSource: 'server_authoritative',
+        verifiedAt,
+      },
+    };
+
+    let newBalance = 0;
+    await scalability.firestore.runTransaction(async (t) => {
+      const userDoc = await t.get(userRef);
+      const currentBalance = userDoc.exists ? (userDoc.data().coins || 0) : 0;
+      newBalance = currentBalance + coinPackage.coinAmount;
+
+      // Credit coins on user document
+      t.update(userRef, {
+        coins: admin.firestore.FieldValue.increment(coinPackage.coinAmount),
+        totalCoinsPurchased: admin.firestore.FieldValue.increment(coinPackage.coinAmount),
+        totalPurchaseCount: admin.firestore.FieldValue.increment(1),
+        lastActiveAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      // Record transaction in user subcollection
+      const userTxnRef = scalability.firestore
+        .collection('users').doc(userId)
+        .collection('transactions').doc(transactionId);
+      t.set(userTxnRef, transactionData);
+
+      // Record in global transactions
+      const globalTxnRef = scalability.firestore
+        .collection('transactions').doc(transactionId);
+      t.set(globalTxnRef, {
+        ...transactionData,
+        userDisplayName: userDoc.exists ? (userDoc.data().name || 'Unknown') : 'Unknown',
+        userGender: userDoc.exists ? (userDoc.data().gender || 'unknown') : 'unknown',
+      });
+
+      // Record payment verification for idempotency
+      const verificationRef = scalability.firestore
+        .collection('payment_verifications').doc(orderId);
+      t.set(verificationRef, {
+        orderId,
+        paymentId,
+        userId,
+        verificationId,
+        packageId: coinPackage.id,
+        coinsCredited: coinPackage.coinAmount,
+        priceInRupees: coinPackage.priceInRupees,
+        newBalance,
+        verifiedAt,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    });
+
+    // Step 5: Update admin analytics (non-critical, outside transaction)
+    try {
+      const analyticsRef = scalability.firestore.collection('admin_analytics').doc('financial_stats');
+      await analyticsRef.set({
+        totalRevenue: admin.firestore.FieldValue.increment(coinPackage.priceInRupees),
+        todayRevenue: admin.firestore.FieldValue.increment(coinPackage.priceInRupees),
+        lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+    } catch (analyticsError) {
+      logger.warn('⚠️ Admin analytics update failed (non-critical):', analyticsError.message);
+    }
+
+    // Step 6: Update male user tracking (non-critical)
+    try {
+      const adminUserRef = scalability.firestore.collection('male_users_admin').doc(userId);
+      await adminUserRef.set({
+        totalCoinsPurchased: admin.firestore.FieldValue.increment(coinPackage.coinAmount),
+        totalPurchaseCount: admin.firestore.FieldValue.increment(1),
+        totalSpentINR: admin.firestore.FieldValue.increment(coinPackage.priceInRupees),
+        lastPurchaseAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+    } catch (trackingError) {
+      logger.warn('⚠️ Male user tracking failed (non-critical):', trackingError.message);
+    }
+
+    logger.info(`✅ Payment verified and coins credited: ${coinPackage.coinAmount} coins to user ${userId}`);
+
     res.json({
       isValid: true,
       verificationId,
       paymentId,
-      userId,
-      verifiedAt: new Date().toISOString(),
+      transactionId,
+      coinsCredited: coinPackage.coinAmount,
+      newBalance,
+      verifiedAt,
     });
+
   } catch (error) {
-    logger.error('❌ Error verifying Razorpay payment:', error);
+    logger.error('❌ Error verifying/crediting Razorpay payment:', error);
     res.status(500).json({ error: 'Payment verification failed' });
   }
 });
@@ -1802,6 +2177,97 @@ app.post('/api/calls/complete', async (req, res) => {
       fraudDetection: fraudDetection
     });
 
+    // Record female earnings (server-authoritative)
+    const effectiveRecipientId = finalRecipientId || serverTimer.recipientId;
+    if (effectiveRecipientId && serverDuration > 0) {
+      try {
+        const earningRate = serverTimer.callType === 'video' ? 0.8 : 0.15;
+        const earningAmount = parseFloat((serverDuration * earningRate).toFixed(2));
+        const dateKey = new Date().toISOString().split('T')[0];
+
+        const femaleEarningsRef = scalability.firestore.collection('female_earnings').doc(effectiveRecipientId);
+        await femaleEarningsRef.set({
+          totalEarningsINR: admin.firestore.FieldValue.increment(earningAmount),
+          availableBalanceINR: admin.firestore.FieldValue.increment(earningAmount),
+          totalCalls: admin.firestore.FieldValue.increment(1),
+          totalDurationSeconds: admin.firestore.FieldValue.increment(serverDuration),
+          [`total${serverTimer.callType === 'video' ? 'Video' : 'Audio'}Calls`]: admin.firestore.FieldValue.increment(1),
+          [`total${serverTimer.callType === 'video' ? 'Video' : 'Audio'}Earnings`]: admin.firestore.FieldValue.increment(earningAmount),
+          lastCallAt: admin.firestore.FieldValue.serverTimestamp(),
+          lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+
+        const dailyRef = femaleEarningsRef.collection('daily').doc(dateKey);
+        await dailyRef.set({
+          date: dateKey,
+          earnings: admin.firestore.FieldValue.increment(earningAmount),
+          calls: admin.firestore.FieldValue.increment(1),
+          durationSeconds: admin.firestore.FieldValue.increment(serverDuration),
+          lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+
+        logger.info(`💰 Female earnings recorded: Rs ${earningAmount} for ${effectiveRecipientId}`);
+      } catch (earningsError) {
+        logger.error(`❌ Failed to record female earnings: ${earningsError.message}`);
+      }
+    }
+
+    // Record spend transaction for male user
+    const effectiveCallerId = finalCallerId || serverTimer.callerId;
+    if (effectiveCallerId && coinsDeducted > 0) {
+      try {
+        const spendTxnId = `txn_call_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`;
+        const spendTxnData = {
+          id: spendTxnId,
+          userId: effectiveCallerId,
+          type: 'spend',
+          status: 'success',
+          coinAmount: coinsDeducted,
+          description: `${serverTimer.callType} call - ${serverDuration}s`,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          metadata: {
+            callId: finalCallId,
+            callType: serverTimer.callType,
+            durationSeconds: serverDuration,
+            coinRate: serverTimer.coinRate,
+            recipientId: effectiveRecipientId,
+          },
+        };
+
+        const batch = scalability.firestore.batch();
+        batch.set(
+          scalability.firestore.collection('users').doc(effectiveCallerId).collection('transactions').doc(spendTxnId),
+          spendTxnData
+        );
+        batch.set(
+          scalability.firestore.collection('transactions').doc(spendTxnId),
+          spendTxnData
+        );
+        batch.update(scalability.firestore.collection('users').doc(effectiveCallerId), {
+          totalCoinsSpent: admin.firestore.FieldValue.increment(coinsDeducted),
+        });
+        await batch.commit();
+
+        logger.info(`📝 Spend transaction recorded: ${spendTxnId}`);
+      } catch (txnError) {
+        logger.error(`❌ Failed to record spend transaction: ${txnError.message}`);
+      }
+    }
+
+    // Update admin analytics (non-critical)
+    try {
+      const analyticsRef = scalability.firestore.collection('admin_analytics').doc('call_stats');
+      await analyticsRef.set({
+        totalCalls: admin.firestore.FieldValue.increment(1),
+        totalDurationSeconds: admin.firestore.FieldValue.increment(serverDuration),
+        totalCoinsDeducted: admin.firestore.FieldValue.increment(coinsDeducted),
+        lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+    } catch (analyticsError) {
+      logger.warn('⚠️ Call analytics update failed:', analyticsError.message);
+    }
+
     callTimers.delete(finalCallId);
 
     // 🆕 Reset user statuses to available
@@ -2905,10 +3371,9 @@ app.use('*', (req, res) => {
 });
 
 // 🆕 PHASE 1 FIX: Heartbeat timeout monitoring
-// 🔧 CRASH FIX: Increased timeout from 60s to 180s (3 minutes) to prevent premature call termination
-// Mobile networks can have brief interruptions, 60s was too aggressive
-const HEARTBEAT_TIMEOUT_MS = 180000; // 3 minutes - more tolerant of network hiccups
-const HEARTBEAT_CHECK_INTERVAL_MS = 60000; // Check every 60 seconds (was 30s)
+// 🔧 Tightened heartbeat: 60s timeout with 15s check interval for faster stale-call detection
+const HEARTBEAT_TIMEOUT_MS = 60000; // 60 seconds
+const HEARTBEAT_CHECK_INTERVAL_MS = 15000; // Check every 15 seconds
 
 setInterval(async () => {
   const now = Date.now();
@@ -3078,31 +3543,6 @@ process.on('unhandledRejection', (reason, promise) => {
   logger.error('💥 Unhandled Rejection at:', promise, 'reason:', reason);
   process.exit(1);
 });
-
-// ============================================================================
-// 🔧 SECURITY FIX: Admin authentication middleware for diagnostic endpoints
-// ============================================================================
-const ADMIN_API_KEY = process.env.ADMIN_API_KEY || 'tingatalk-admin-key-2024';
-
-const adminAuth = (req, res, next) => {
-  const apiKey = req.headers['x-admin-key'];
-
-  // Allow requests without auth in development mode
-  if (process.env.NODE_ENV !== 'production') {
-    return next();
-  }
-
-  // Check API key
-  if (apiKey !== ADMIN_API_KEY) {
-    logger.warn(`Unauthorized access attempt to ${req.path} from ${req.ip}`);
-    return res.status(401).json({
-      error: 'Unauthorized',
-      message: 'Valid admin API key required for this endpoint'
-    });
-  }
-
-  next();
-};
 
 // ============================================================================
 // 🔧 REDIS TIMER PERSISTENCE: Store timer metadata for crash recovery
