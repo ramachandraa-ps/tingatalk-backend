@@ -1,0 +1,1200 @@
+openapi: 3.0.0
+info:
+  title: TingaTalk Backend API
+  version: 2.0.0
+  description: |
+    Backend API for TingaTalk — a video/audio calling app with coin-based billing.
+
+    ## Authentication
+    Most endpoints require a Firebase ID token in the `Authorization: Bearer {token}` header.
+    Admin endpoints require an `X-Admin-API-Key` header.
+
+    ## Real-time Communication
+    Socket.IO is used for call signaling (initiate, accept, decline, end, cancel).
+    See the Socket.IO Events section at the bottom for details.
+  contact:
+    name: TingaTalk Team
+
+servers:
+  - url: http://147.79.66.3:3000
+    description: Production VPS
+  - url: http://localhost:3000
+    description: Local development
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: Firebase ID Token
+      description: Firebase Authentication ID token
+    adminApiKey:
+      type: apiKey
+      in: header
+      name: X-Admin-API-Key
+      description: Admin API key for diagnostic endpoints
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+        details:
+          type: string
+          description: Only present in development mode
+
+    CoinPackage:
+      type: object
+      properties:
+        id:
+          type: string
+          example: popular_pack
+        name:
+          type: string
+          example: Popular Pack
+        coinAmount:
+          type: integer
+          example: 500
+        priceInRupees:
+          type: number
+          example: 399
+        discountPercent:
+          type: integer
+          example: 20
+        isPopular:
+          type: boolean
+        isActive:
+          type: boolean
+
+    AvailableFemale:
+      type: object
+      properties:
+        userId:
+          type: string
+        name:
+          type: string
+        age:
+          type: integer
+        photoUrl:
+          type: string
+        fullPhotoUrl:
+          type: string
+        isOnline:
+          type: boolean
+          description: WebSocket connection status (true = online, false = background/offline)
+        isAvailable:
+          type: boolean
+          description: Always true (filtered by query)
+        rating:
+          type: number
+          format: float
+          description: Rating 0-10 scale
+        totalCalls:
+          type: integer
+        totalLikes:
+          type: integer
+        relationshipStatus:
+          type: string
+
+paths:
+  # ============================================
+  # HEALTH
+  # ============================================
+  /api/health:
+    get:
+      tags: [Health]
+      summary: Server health check
+      description: Returns server status, memory usage, uptime, active calls/users, and infrastructure connectivity.
+      responses:
+        '200':
+          description: Server is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: OK
+                  timestamp:
+                    type: string
+                    format: date-time
+                  activeCalls:
+                    type: integer
+                  connectedUsers:
+                    type: integer
+                  busyUsers:
+                    type: integer
+                  clustering:
+                    type: object
+                    properties:
+                      enabled:
+                        type: boolean
+                      instanceId:
+                        type: string
+                      processId:
+                        type: integer
+                  infrastructure:
+                    type: object
+                    properties:
+                      redis:
+                        type: string
+                        example: connected
+                      firestore:
+                        type: string
+                        example: connected
+                  serverInfo:
+                    type: object
+                    properties:
+                      port:
+                        type: integer
+                      host:
+                        type: string
+                      nodeVersion:
+                        type: string
+                      uptime:
+                        type: integer
+                      uptimeFormatted:
+                        type: string
+                      memoryUsage:
+                        type: object
+                      environment:
+                        type: string
+                      pid:
+                        type: integer
+
+  # ============================================
+  # AUTH
+  # ============================================
+  /api/auth/check-user:
+    post:
+      tags: [Auth]
+      summary: Check if user exists by phone number
+      description: Pre-authentication endpoint. Checks Firestore for a user with the given phone number.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phoneNumber]
+              properties:
+                phoneNumber:
+                  type: string
+                  example: "9876543210"
+      responses:
+        '200':
+          description: User existence check result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  exists:
+                    type: boolean
+                  user:
+                    type: object
+                    nullable: true
+                    properties:
+                      userId:
+                        type: string
+                      name:
+                        type: string
+                      gender:
+                        type: string
+                        enum: [male, female]
+                      isVerified:
+                        type: boolean
+                      profileImageUrl:
+                        type: string
+                        nullable: true
+        '400':
+          description: Invalid phone number
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ============================================
+  # PACKAGES
+  # ============================================
+  /api/packages:
+    get:
+      tags: [Packages]
+      summary: Get available coin packages
+      description: Returns all active coin packages with pricing.
+      responses:
+        '200':
+          description: List of coin packages
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  packages:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CoinPackage'
+
+  # ============================================
+  # USER BALANCE
+  # ============================================
+  /api/user/{userId}/balance:
+    get:
+      tags: [Users]
+      summary: Get user's coin balance
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: userId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: User balance
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  userId:
+                    type: string
+                  balance:
+                    type: number
+                  currency:
+                    type: string
+                    example: coins
+                  timestamp:
+                    type: string
+                    format: date-time
+        '404':
+          description: User not found
+
+  # ============================================
+  # AVAILABILITY
+  # ============================================
+  /api/check_availability:
+    post:
+      tags: [Availability]
+      summary: Check if recipient is available for calls
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [recipient_id]
+              properties:
+                recipient_id:
+                  type: string
+      responses:
+        '200':
+          description: Availability status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  is_available:
+                    type: boolean
+                  user_status:
+                    type: string
+                    enum: [available, unavailable, busy, ringing, disconnected]
+                  current_call_id:
+                    type: string
+                    nullable: true
+                  message:
+                    type: string
+
+  /api/update_availability:
+    post:
+      tags: [Availability]
+      summary: Update user availability toggle
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id, is_available]
+              properties:
+                user_id:
+                  type: string
+                is_available:
+                  type: boolean
+      responses:
+        '200':
+          description: Availability updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  user_id:
+                    type: string
+                  is_available:
+                    type: boolean
+                  status:
+                    type: string
+                  message:
+                    type: string
+                  timestamp:
+                    type: string
+                    format: date-time
+
+  /api/get_available_females:
+    get:
+      tags: [Availability]
+      summary: Get list of available female users
+      description: |
+        Returns verified female users with toggle ON (isAvailable=true).
+        Enriched with real-time online status from WebSocket and stats from PowerUps subcollection.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: List of available females
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  available_females:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AvailableFemale'
+                  count:
+                    type: integer
+                  timestamp:
+                    type: string
+                    format: date-time
+
+  # ============================================
+  # CALLS
+  # ============================================
+  /api/calls/start:
+    post:
+      tags: [Calls]
+      summary: Start call with server-side billing
+      description: |
+        Validates caller balance, checks recipient availability, creates Firestore call document,
+        and starts server-side duration timer. Requires minimum 120 coins for video, 24 for audio.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [callId, callerId, recipientId, callType]
+              properties:
+                callId:
+                  type: string
+                  example: call_user1_user2_1709913600000
+                callerId:
+                  type: string
+                recipientId:
+                  type: string
+                callType:
+                  type: string
+                  enum: [video, audio]
+                roomName:
+                  type: string
+                  example: video_user1_user2
+      responses:
+        '200':
+          description: Call started
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  callId:
+                    type: string
+                  serverStartTime:
+                    type: string
+                    format: date-time
+                  callerBalance:
+                    type: number
+                  coinRate:
+                    type: number
+                    description: "1.0 for video, 0.2 for audio"
+                  message:
+                    type: string
+        '400':
+          description: Insufficient balance or recipient unavailable
+        '404':
+          description: Caller not found
+
+  /api/calls/complete:
+    post:
+      tags: [Calls]
+      summary: Complete call and deduct coins
+      description: |
+        Stops server-side timer, calculates coins based on server duration (source of truth),
+        deducts from caller, credits female earnings, records transactions.
+        Includes fraud detection comparing server vs client duration.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [callId]
+              properties:
+                callId:
+                  type: string
+                callerId:
+                  type: string
+                recipientId:
+                  type: string
+                endReason:
+                  type: string
+                  example: User ended call
+                client_duration_seconds:
+                  type: number
+                  description: Client-reported duration for fraud detection
+      responses:
+        '200':
+          description: Call completed and billed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  callId:
+                    type: string
+                  durationSeconds:
+                    type: integer
+                    description: Server-authoritative duration
+                  coinsDeducted:
+                    type: number
+                  newBalance:
+                    type: number
+                  coinRate:
+                    type: number
+                  callType:
+                    type: string
+                  source:
+                    type: string
+                    enum: [server, client_fallback, already_completed]
+                  fraudDetection:
+                    type: object
+                    nullable: true
+                    properties:
+                      clientDuration:
+                        type: number
+                      serverDuration:
+                        type: number
+                      differenceSeconds:
+                        type: number
+                      isSuspicious:
+                        type: boolean
+
+  /api/calls/heartbeat:
+    post:
+      tags: [Calls]
+      summary: Call heartbeat / keep-alive
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [callId]
+              properties:
+                callId:
+                  type: string
+                userId:
+                  type: string
+                callerId:
+                  type: string
+                  description: Legacy field, userId preferred
+      responses:
+        '200':
+          description: Heartbeat acknowledged
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  callId:
+                    type: string
+                  currentDurationSeconds:
+                    type: integer
+                  estimatedCost:
+                    type: number
+                  coinRate:
+                    type: number
+        '404':
+          description: Call not found
+
+  /api/call/{callId}:
+    get:
+      tags: [Calls]
+      summary: Get call details
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: callId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Call data
+        '404':
+          description: Call not found
+
+  /api/check_call_status:
+    post:
+      tags: [Calls]
+      summary: Check if a call is still active
+      description: Checks in-memory active calls first, then falls back to Firestore history.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [call_id]
+              properties:
+                call_id:
+                  type: string
+                caller_id:
+                  type: string
+                recipient_id:
+                  type: string
+      responses:
+        '200':
+          description: Call status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  call_active:
+                    type: boolean
+                  call_status:
+                    type: string
+                  is_ringing:
+                    type: boolean
+                  is_connected:
+                    type: boolean
+                  is_ended:
+                    type: boolean
+                  ended_reason:
+                    type: string
+                    nullable: true
+                  call_data:
+                    type: object
+                  message:
+                    type: string
+
+  /api/validate_balance:
+    post:
+      tags: [Calls]
+      summary: Pre-call balance validation
+      description: Checks if user has enough coins for minimum 2-minute call.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id, call_type, current_balance]
+              properties:
+                user_id:
+                  type: string
+                call_type:
+                  type: string
+                  enum: [video, audio]
+                current_balance:
+                  type: number
+      responses:
+        '200':
+          description: Balance validation result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  has_sufficient_balance:
+                    type: boolean
+                  current_balance:
+                    type: number
+                  required_balance:
+                    type: number
+                    description: "120 for video, 24 for audio"
+                  coin_rate_per_second:
+                    type: number
+                    description: "1.0 for video, 0.2 for audio"
+                  minimum_duration_seconds:
+                    type: integer
+                    example: 120
+                  message:
+                    type: string
+
+  /api/generate_token:
+    post:
+      tags: [Calls]
+      summary: Generate Twilio access token
+      description: Generates a Twilio Video/Audio access token with 30-minute TTL.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_identity, room_name]
+              properties:
+                user_identity:
+                  type: string
+                room_name:
+                  type: string
+                  pattern: "^(video|audio)_[a-zA-Z0-9_]+$"
+                  example: video_user1_user2
+                is_video:
+                  type: boolean
+                  default: true
+      responses:
+        '200':
+          description: Twilio token generated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accessToken:
+                    type: string
+                  room_name:
+                    type: string
+                  user_identity:
+                    type: string
+                  is_video:
+                    type: boolean
+                  coin_rate_per_second:
+                    type: number
+                  expiresAt:
+                    type: string
+                    format: date-time
+                  server_timestamp:
+                    type: string
+                    format: date-time
+
+  # ============================================
+  # LEGACY CALL ENDPOINTS
+  # ============================================
+  /api/start_call_tracking:
+    post:
+      tags: [Calls (Legacy)]
+      summary: "[LEGACY] Start call tracking"
+      description: Legacy endpoint. Use /api/calls/start instead.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [call_id, caller_id, recipient_id, call_type]
+              properties:
+                call_id:
+                  type: string
+                caller_id:
+                  type: string
+                recipient_id:
+                  type: string
+                call_type:
+                  type: string
+                  enum: [video, audio]
+                room_name:
+                  type: string
+      responses:
+        '200':
+          description: Tracking started
+
+  /api/complete_call:
+    post:
+      tags: [Calls (Legacy)]
+      summary: "[LEGACY] Complete call"
+      description: Legacy endpoint. Use /api/calls/complete instead.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [call_id]
+              properties:
+                call_id:
+                  type: string
+                client_duration_seconds:
+                  type: number
+                client_coins_deducted:
+                  type: number
+      responses:
+        '200':
+          description: Call completed
+
+  # ============================================
+  # PAYMENTS
+  # ============================================
+  /api/payments/orders:
+    post:
+      tags: [Payments]
+      summary: Create Razorpay payment order
+      description: Creates a Razorpay order for coin purchase. Pricing is server-authoritative from package registry.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [packageId]
+              properties:
+                packageId:
+                  type: string
+                  enum: [starter_pack, popular_pack, value_pack, premium_pack]
+                currency:
+                  type: string
+                  default: INR
+                userName:
+                  type: string
+                receipt:
+                  type: string
+                notes:
+                  type: object
+      responses:
+        '200':
+          description: Razorpay order created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  order_id:
+                    type: string
+                    example: order_N1234567890
+                  amount:
+                    type: integer
+                    description: Amount in paise
+                    example: 39900
+                  currency:
+                    type: string
+                    example: INR
+                  key_id:
+                    type: string
+                    description: Razorpay key ID for client
+        '400':
+          description: Invalid packageId
+
+  /api/payments/verify:
+    post:
+      tags: [Payments]
+      summary: Verify payment and credit coins
+      description: |
+        Verifies Razorpay payment signature (HMAC-SHA256), checks idempotency,
+        credits coins via atomic Firestore transaction. Returns existing verification on duplicate.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [orderId, paymentId, signature]
+              properties:
+                orderId:
+                  type: string
+                paymentId:
+                  type: string
+                signature:
+                  type: string
+      responses:
+        '200':
+          description: Payment verified and coins credited
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  isValid:
+                    type: boolean
+                  verificationId:
+                    type: string
+                  paymentId:
+                    type: string
+                  transactionId:
+                    type: string
+                  coinsCredited:
+                    type: integer
+                  newBalance:
+                    type: number
+                  verifiedAt:
+                    type: string
+                    format: date-time
+                  duplicate:
+                    type: boolean
+                    description: True if this was a duplicate verification (idempotent)
+        '400':
+          description: Invalid signature or unknown package
+
+  # ============================================
+  # REWARDS
+  # ============================================
+  /api/rewards/daily-claim:
+    post:
+      tags: [Rewards]
+      summary: Claim daily reward (10 coins)
+      description: |
+        Awards 10 coins per day. Tracks streaks (current, highest).
+        Uses atomic Firestore transaction with double-check inside transaction.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Daily reward claimed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  coinsCredited:
+                    type: integer
+                    example: 10
+                  transactionId:
+                    type: string
+                  currentStreak:
+                    type: integer
+                  highestStreak:
+                    type: integer
+                  streakBroken:
+                    type: boolean
+                  isFirstTime:
+                    type: boolean
+                  newBalance:
+                    type: number
+                  nextClaimTime:
+                    type: string
+                    format: date-time
+        '400':
+          description: Already claimed today
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: Already claimed today
+                  nextClaimTime:
+                    type: string
+                    format: date-time
+
+  # ============================================
+  # PAYOUTS
+  # ============================================
+  /api/razorpay/contact-sync:
+    post:
+      tags: [Payouts]
+      summary: Sync female payment account with Razorpay
+      description: Creates or updates a Razorpay Contact and Fund Account (bank or UPI).
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [userId, accountHolderName]
+              properties:
+                userId:
+                  type: string
+                userName:
+                  type: string
+                phoneNumber:
+                  type: string
+                accountHolderName:
+                  type: string
+                accountNumber:
+                  type: string
+                  description: Required if no upiId
+                ifsc:
+                  type: string
+                bankName:
+                  type: string
+                upiId:
+                  type: string
+                  description: Required if no accountNumber
+                accountType:
+                  type: string
+                  default: savings
+                existingContactId:
+                  type: string
+                existingFundAccountId:
+                  type: string
+      responses:
+        '200':
+          description: Account synced
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  contactId:
+                    type: string
+                  fundAccountId:
+                    type: string
+                  status:
+                    type: string
+                    example: verified
+
+  /api/female/payouts:
+    post:
+      tags: [Payouts]
+      summary: Initiate female payout
+      description: Creates a Razorpay payout via IMPS mode.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fundAccountId, amount]
+              properties:
+                fundAccountId:
+                  type: string
+                amount:
+                  type: number
+                  description: Amount in INR
+                currency:
+                  type: string
+                  default: INR
+                userId:
+                  type: string
+                userName:
+                  type: string
+                purpose:
+                  type: string
+                  default: payout
+      responses:
+        '200':
+          description: Payout initiated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  payoutId:
+                    type: string
+                  status:
+                    type: string
+                  referenceId:
+                    type: string
+
+  # ============================================
+  # STATS
+  # ============================================
+  /api/refresh_user_stats:
+    post:
+      tags: [Stats]
+      summary: Refresh user stats from PowerUps subcollection
+      description: Recalculates rating, totalCalls, totalLikes from powerups subcollection. Falls back to main document.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id]
+              properties:
+                user_id:
+                  type: string
+      responses:
+        '200':
+          description: Stats refreshed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  user_id:
+                    type: string
+                  stats:
+                    type: object
+                    properties:
+                      rating:
+                        type: number
+                      totalCalls:
+                        type: integer
+                      totalLikes:
+                        type: integer
+                      totalDislikes:
+                        type: integer
+                      source:
+                        type: string
+                        enum: [powerups_subcollection, main_document, default]
+                  consistency_check:
+                    type: object
+                    properties:
+                      is_consistent:
+                        type: boolean
+                      checked_at:
+                        type: string
+                        format: date-time
+
+  /api/batch_refresh_stats:
+    post:
+      tags: [Stats]
+      summary: Batch refresh stats for multiple users
+      description: Maximum 50 users per batch.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_ids]
+              properties:
+                user_ids:
+                  type: array
+                  items:
+                    type: string
+                  maxItems: 50
+      responses:
+        '200':
+          description: Batch results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  batch_results:
+                    type: object
+                    properties:
+                      success:
+                        type: array
+                        items:
+                          type: string
+                      failed:
+                        type: array
+                        items:
+                          type: object
+                      total:
+                        type: integer
+
+  # ============================================
+  # DIAGNOSTICS (Admin)
+  # ============================================
+  /api/diagnostic/connections:
+    get:
+      tags: [Diagnostics]
+      summary: Get all Socket.IO connections
+      security:
+        - adminApiKey: []
+      responses:
+        '200':
+          description: Connection diagnostics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  timestamp:
+                    type: string
+                    format: date-time
+                  totalSocketsConnected:
+                    type: integer
+                  connectedUsers:
+                    type: array
+                    items:
+                      type: object
+                  userStatus:
+                    type: array
+                    items:
+                      type: object
+                  activeCalls:
+                    type: array
+                    items:
+                      type: object
+                  socketRooms:
+                    type: array
+                    items:
+                      type: object
+        '403':
+          description: Invalid admin API key
+
+  /api/diagnostic/user/{userId}:
+    get:
+      tags: [Diagnostics]
+      summary: Get specific user's connection state
+      security:
+        - adminApiKey: []
+      parameters:
+        - in: path
+          name: userId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: User connection details
+        '404':
+          description: User not connected
