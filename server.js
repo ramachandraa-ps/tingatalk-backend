@@ -11,6 +11,11 @@ const Razorpay = require('razorpay');
 const axios = require('axios');
 require('dotenv').config();
 const admin = require('firebase-admin');
+
+// Server configuration (declared early — used in health endpoint and server.listen)
+const PORT = process.env.PORT || 3000;
+const HOST = process.env.HOST || '0.0.0.0';
+
 // ============================================================================
 // SCALABILITY: Redis + PostgreSQL + Clustering Support
 // ============================================================================
@@ -208,7 +213,7 @@ const limiter = rateLimit({
 });
 app.use('/api/', limiter);
 
-// Apply Firebase auth to financial, call, and token endpoints
+// Apply Firebase auth to all sensitive endpoints
 app.use('/api/payments', verifyFirebaseToken);
 app.use('/api/rewards', verifyFirebaseToken);
 app.use('/api/calls', verifyFirebaseToken);
@@ -216,6 +221,15 @@ app.use('/api/validate_balance', verifyFirebaseToken);
 app.use('/api/user', verifyFirebaseToken);
 app.use('/api/generate_token', verifyFirebaseToken);
 app.use('/api/check_call_status', verifyFirebaseToken);
+app.use('/api/razorpay', verifyFirebaseToken);
+app.use('/api/female', verifyFirebaseToken);
+app.use('/api/check_availability', verifyFirebaseToken);
+app.use('/api/update_availability', verifyFirebaseToken);
+app.use('/api/get_available_females', verifyFirebaseToken);
+app.use('/api/start_call_tracking', verifyFirebaseToken);
+app.use('/api/complete_call', verifyFirebaseToken);
+app.use('/api/refresh_user_stats', verifyFirebaseToken);
+app.use('/api/batch_refresh_stats', verifyFirebaseToken);
 
 // ============================================================================
 // PRODUCTION ENHANCEMENTS: Call State Management
@@ -2475,7 +2489,7 @@ io.on('connection', (socket) => {
     logger.info(`🚪 Room ${roomName} contains: ${rooms.includes(roomName) ? '✅ THIS SOCKET' : '❌ NOT FOUND'}`);
     
     const userStatusObj = userStatus.get(userId);
-    logger.info(`👤 User ${userId} (${userType || 'unknown'}) joined - Socket: ${socket.id} - Status: ${userStatusObj.status}`);
+    logger.info(`👤 User ${userId} (${userType || 'unknown'}) joined - Socket: ${socket.id} - Status: ${userStatusObj ? userStatusObj.status : 'unknown'}`);
 
     // 🆕 UPDATE FIRESTORE: Mark user as online when they connect
     try {
@@ -2531,8 +2545,8 @@ io.on('connection', (socket) => {
 
     // Check if recipient has active WebSocket connection
     if (recipientConnection && recipientConnection.isOnline) {
-      const socket = io.sockets.sockets.get(recipientConnection.socketId);
-      if (socket && socket.connected) {
+      const recipientWs = io.sockets.sockets.get(recipientConnection.socketId);
+      if (recipientWs && recipientWs.connected) {
         hasConnection = true;
         actualStatus = recipientStatus ? recipientStatus.status : 'available';
         // Fix missing status
@@ -3490,9 +3504,6 @@ setInterval(() => {
 logger.info(`✅ Heartbeat timeout monitor initialized (timeout: ${HEARTBEAT_TIMEOUT_MS / 1000}s, check interval: ${HEARTBEAT_CHECK_INTERVAL_MS / 1000}s)`);
 
 // Start server
-const PORT = process.env.PORT || 3000;
-const HOST = process.env.HOST || '0.0.0.0';
-
 server.listen(PORT, HOST, () => {
   logger.info(`🚀 TingaTalk Enhanced Backend Server running on ${HOST}:${PORT}`);
   logger.info(`📡 WebSocket server ready for connections`);
@@ -3500,8 +3511,9 @@ server.listen(PORT, HOST, () => {
   logger.info(`💰 Coin rates: Audio ${COIN_RATES.audio}/s, Video ${COIN_RATES.video}/s`);
   logger.info(`⏱️  Minimum balance: Audio ${MIN_BALANCE_AUDIO} coins, Video ${MIN_BALANCE_VIDEO} coins`);
   logger.info(`🔒 Concurrent call prevention: ENABLED`);
-  logger.info(`🌍 CORS enabled for: ${corsOptions.origin}`);
-  logger.info(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);  logger.info(`📊 Process ID: ${process.pid}`);
+  logger.info(`🌍 CORS enabled for: ${process.env.CORS_ORIGIN || 'default origins (tingatalk.in)'}`);
+  logger.info(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
+  logger.info(`📊 Process ID: ${process.pid}`);
 });
 
 // Graceful shutdown
@@ -3635,7 +3647,7 @@ async function deductCoinsAtomically(callerId, amount, callId) {
 
       transaction.update(userRef, {
         coins: newBalance,
-        lastDeductedAt: scalability.admin.firestore.FieldValue.serverTimestamp()
+        lastDeductedAt: admin.firestore.FieldValue.serverTimestamp()
       });
 
       const txnRef = db.collection('transactions').doc();
@@ -3646,7 +3658,7 @@ async function deductCoinsAtomically(callerId, amount, callId) {
         type: 'call_charge',
         previousBalance: currentBalance,
         newBalance: newBalance,
-        createdAt: scalability.admin.firestore.FieldValue.serverTimestamp()
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
 
       logger.info(`✅ Atomic deduction: ${callerId} - ${amount} coins (${currentBalance} -> ${newBalance})`);
