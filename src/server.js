@@ -27,6 +27,9 @@ async function main() {
   // 4. Attach Socket.IO
   const io = createSocketServer(server, corsOptions);
 
+  // 4b. Make io accessible via req.app.get('io') in route handlers
+  app.set('io', io);
+
   // 5. Start background jobs (pass io for emitting events)
   startBackgroundJobs(io);
 

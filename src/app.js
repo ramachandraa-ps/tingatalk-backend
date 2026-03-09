@@ -62,18 +62,18 @@ export function createApp() {
   app.use('/api/auth', authRoutes);
   app.use('/api/packages', packagesRoutes);
 
+  // --- Admin routes (before catch-all /api auth routes) ---
+  app.use('/api/diagnostic', diagnosticsRoutes);
+
   // --- Authenticated routes ---
   app.use('/api/user', authenticate, usersRoutes);
-  app.use('/api', authenticate, availabilityRoutes);
   app.use('/api/calls', authenticate, callsRoutes);
-  app.use('/api', authenticate, callsStandaloneRoutes);
   app.use('/api/payments', authenticate, paymentsRoutes);
   app.use('/api/rewards', authenticate, rewardsRoutes);
+  app.use('/api', authenticate, availabilityRoutes);
+  app.use('/api', authenticate, callsStandaloneRoutes);
   app.use('/api', authenticate, payoutsRoutes);
   app.use('/api', authenticate, statsRoutes);
-
-  // --- Admin routes ---
-  app.use('/api/diagnostic', diagnosticsRoutes);
 
   // Error handling (must be last)
   app.use(notFoundHandler);
