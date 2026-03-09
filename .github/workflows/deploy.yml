@@ -27,10 +27,14 @@ jobs:
             cd /var/www/tingatalk-backend
 
             echo "Pulling latest changes..."
-            git pull origin main
+            git fetch origin main
+            git reset --hard origin/main
 
             echo "Installing dependencies..."
             npm install --production
+
+            echo "Running build check..."
+            npm run build
 
             echo "Restarting PM2 process..."
             pm2 restart tingatalk-backend || pm2 start ecosystem.config.js --env production
