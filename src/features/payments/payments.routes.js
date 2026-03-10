@@ -94,7 +94,7 @@ router.post('/verify', async (req, res) => {
     let newBalance = 0;
     await db.runTransaction(async (t) => {
       const userDoc = await t.get(userRef);
-      const currentBalance = userDoc.exists ? (userDoc.data().coins || 0) : 0;
+      const currentBalance = userDoc.exists ? (userDoc.data().coins ?? 0) : 0;
       newBalance = currentBalance + coinPackage.coinAmount;
 
       t.update(userRef, {

@@ -21,7 +21,7 @@ router.post('/daily-claim', async (req, res) => {
     const highestStreak = userData.highestStreak || 0;
 
     const now = new Date();
-    const todayMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const todayMidnight = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
 
     let nextStreak = 1;
     let streakBroken = false;
@@ -31,7 +31,7 @@ router.post('/daily-claim', async (req, res) => {
       isFirstTime = true;
     } else {
       const lastDate = lastRewardAt.toDate ? lastRewardAt.toDate() : new Date(lastRewardAt);
-      const lastMidnight = new Date(lastDate.getFullYear(), lastDate.getMonth(), lastDate.getDate());
+      const lastMidnight = new Date(Date.UTC(lastDate.getUTCFullYear(), lastDate.getUTCMonth(), lastDate.getUTCDate()));
 
       if (lastMidnight.getTime() === todayMidnight.getTime()) {
         return res.status(400).json({
@@ -77,7 +77,7 @@ router.post('/daily-claim', async (req, res) => {
 
         if (freshLastReward) {
           const lastDate = freshLastReward.toDate ? freshLastReward.toDate() : new Date(freshLastReward);
-          const lastMidnight = new Date(lastDate.getFullYear(), lastDate.getMonth(), lastDate.getDate());
+          const lastMidnight = new Date(Date.UTC(lastDate.getUTCFullYear(), lastDate.getUTCMonth(), lastDate.getUTCDate()));
           if (lastMidnight.getTime() === todayMidnight.getTime()) {
             throw new Error('ALREADY_CLAIMED');
           }
@@ -101,7 +101,7 @@ router.post('/daily-claim', async (req, res) => {
 
     // Get updated balance
     const updatedDoc = await db.collection('users').doc(userId).get();
-    const newBalance = updatedDoc.data()?.coins || updatedDoc.data()?.coinBalance || 0;
+    const newBalance = updatedDoc.data()?.coins ?? updatedDoc.data()?.coinBalance ?? 0;
 
     res.json({
       success: true, coinsCredited: DAILY_REWARD_COINS, transactionId,

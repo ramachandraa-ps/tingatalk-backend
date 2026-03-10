@@ -16,7 +16,7 @@ router.get('/:userId/balance', async (req, res) => {
     if (!userDoc.exists) return res.status(404).json({ error: 'User not found' });
 
     const data = userDoc.data();
-    const balance = data.coinBalance || data.coins || 0;
+    const balance = data.coins ?? data.coinBalance ?? 0;
 
     res.json({
       success: true,

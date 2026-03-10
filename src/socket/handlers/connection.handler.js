@@ -132,7 +132,9 @@ export function registerConnectionHandlers(io, socket) {
         const callId = currentStatus.currentCallId;
         const call = getActiveCall(callId);
 
-        if (call) {
+        if (call && call.status === 'completed') {
+          logger.info(`Call ${callId} already completed — skipping disconnect billing`);
+        } else if (call) {
           logger.warn(`User ${userId} disconnected during active call ${callId}`);
 
           // Notify other participants
@@ -189,6 +191,9 @@ export function registerConnectionHandlers(io, socket) {
               }
             }
 
+            // Mark call as completed before completeCall to prevent re-entry
+            call.status = 'completed';
+
             completeCall(callId, {
               status: 'disconnected',
               endReason: 'connection_lost',
@@ -201,6 +206,8 @@ export function registerConnectionHandlers(io, socket) {
             deleteCallTimer(callId);
             logger.info(`Call ${callId} completed on disconnect - Firestore updated`);
           } else {
+            call.status = 'completed';
+
             completeCall(callId, {
               status: 'disconnected',
               endReason: 'connection_lost_before_connect',

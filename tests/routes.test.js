@@ -271,9 +271,11 @@ describe('Route Wiring Tests', () => {
       expect(res.status).toBe(401);
     });
 
-    it('POST /api/check_availability → 401', async () => {
+    it('POST /api/check_availability → 200 (public)', async () => {
       const res = await req('POST', '/api/check_availability', { recipient_id: 'u1' });
-      expect(res.status).toBe(401);
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body).toHaveProperty('is_available');
     });
 
     it('POST /api/payments/orders → 401', async () => {
@@ -291,14 +293,15 @@ describe('Route Wiring Tests', () => {
       expect(res.status).toBe(401);
     });
 
-    it('POST /api/validate_balance → 401', async () => {
-      const res = await req('POST', '/api/validate_balance', { user_id: 'u1' });
-      expect(res.status).toBe(401);
+    it('POST /api/validate_balance → public (no auth required)', async () => {
+      const res = await req('POST', '/api/validate_balance', { user_id: 'u1', call_type: 'video' });
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveProperty('has_sufficient_balance');
     });
 
-    it('POST /api/generate_token → 401', async () => {
-      const res = await req('POST', '/api/generate_token', { user_identity: 'u1' });
-      expect(res.status).toBe(401);
+    it('POST /api/generate_token → public (no auth required)', async () => {
+      const res = await req('POST', '/api/generate_token', { user_identity: 'u1', room_name: 'video_u1_u2' });
+      expect(res.status).toBe(200);
     });
 
     it('POST /api/razorpay/contact-sync → 401', async () => {
@@ -351,23 +354,29 @@ describe('Route Wiring Tests', () => {
       expect(res.body.status).toBe('available');
     });
 
-    it('POST /api/validate_balance → balance check', async () => {
+    it('POST /api/validate_balance → server-authoritative balance check', async () => {
       const res = await req('POST', '/api/validate_balance', {
-        user_id: 'u1', call_type: 'video', current_balance: 200
+        user_id: 'u1', call_type: 'video'
       }, auth);
       expect(res.status).toBe(200);
-      expect(res.body).toHaveProperty('has_sufficient_balance');
+      // Mock user has coins: 500, video requires 120 — sufficient
+      expect(res.body.has_sufficient_balance).toBe(true);
+      expect(res.body).toHaveProperty('current_balance', 500);
       expect(res.body).toHaveProperty('required_balance', 120);
       expect(res.body).toHaveProperty('coin_rate_per_second', 1.0);
       expect(res.body).toHaveProperty('minimum_duration_seconds', 120);
+      expect(res.body).toHaveProperty('shortfall', 0);
     });
 
-    it('POST /api/validate_balance → insufficient balance', async () => {
+    it('POST /api/validate_balance → audio balance check', async () => {
       const res = await req('POST', '/api/validate_balance', {
-        user_id: 'u1', call_type: 'video', current_balance: 50
+        user_id: 'u1', call_type: 'audio'
       }, auth);
       expect(res.status).toBe(200);
-      expect(res.body.has_sufficient_balance).toBe(false);
+      // Mock user has coins: 500, audio requires 24 — sufficient
+      expect(res.body.has_sufficient_balance).toBe(true);
+      expect(res.body).toHaveProperty('current_balance', 500);
+      expect(res.body).toHaveProperty('required_balance', 24);
     });
 
     it('POST /api/payments/orders → creates order for valid package', async () => {

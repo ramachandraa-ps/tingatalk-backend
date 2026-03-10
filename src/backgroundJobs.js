@@ -54,7 +54,7 @@ function startHeartbeatMonitor(io) {
               const userRef = db.collection('users').doc(timer.callerId);
               const userDoc = await transaction.get(userRef);
               if (userDoc.exists) {
-                const currentBalance = userDoc.data().coins || 0;
+                const currentBalance = userDoc.data().coins ?? 0;
                 const newBalance = Math.max(0, currentBalance - coinsToDeduct);
                 transaction.update(userRef, {
                   coins: newBalance,

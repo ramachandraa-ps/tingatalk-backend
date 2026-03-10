@@ -80,22 +80,33 @@ router.post('/check_call_status', async (req, res) => {
 // POST /api/validate_balance
 router.post('/validate_balance', async (req, res) => {
   try {
-    const { user_id, call_type, current_balance } = req.body;
+    const { user_id, call_type } = req.body;
 
-    if (!user_id || !call_type || current_balance === undefined) {
-      return res.status(400).json({ error: 'Missing required fields: user_id, call_type, current_balance' });
+    if (!user_id || !call_type) {
+      return res.status(400).json({ error: 'Missing required fields: user_id, call_type' });
     }
+
+    // Server-authoritative: read actual balance from Firestore
+    const db = getFirestore();
+    const userDoc = await db.collection('users').doc(user_id).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const userData = userDoc.data();
+    const actualBalance = userData.coins ?? userData.coinBalance ?? 0;
 
     const isVideo = call_type === 'video';
     const requiredBalance = isVideo ? MIN_BALANCE.video : MIN_BALANCE.audio;
     const coinRate = isVideo ? COIN_RATES.video : COIN_RATES.audio;
-    const hasEnoughBalance = current_balance >= requiredBalance;
+    const hasEnoughBalance = actualBalance >= requiredBalance;
 
     res.json({
       success: hasEnoughBalance,
       has_sufficient_balance: hasEnoughBalance,
-      current_balance,
+      current_balance: actualBalance,
       required_balance: requiredBalance,
+      shortfall: hasEnoughBalance ? 0 : Math.max(0, requiredBalance - actualBalance),
       coin_rate_per_second: coinRate,
       minimum_duration_seconds: MIN_CALL_DURATION_SECONDS,
       call_type,
@@ -208,7 +219,7 @@ router.post('/complete_call', async (req, res) => {
 
     clearInterval(serverTimer.interval);
     const serverDuration = serverTimer.durationSeconds;
-    const serverCoinsDeducted = serverDuration * serverTimer.coinRate;
+    const serverCoinsDeducted = Math.ceil(serverDuration * serverTimer.coinRate);
 
     const durationDiff = Math.abs(serverDuration - (client_duration_seconds || 0));
     const isFraudulent = durationDiff > 5;
@@ -222,7 +233,7 @@ router.post('/complete_call', async (req, res) => {
     res.json({
       success: true, call_id,
       duration_seconds: serverDuration,
-      coins_deducted: parseFloat(serverCoinsDeducted.toFixed(2)),
+      coins_deducted: serverCoinsDeducted,
       coin_rate_per_second: serverTimer.coinRate,
       call_type: serverTimer.callType,
       source: 'server',

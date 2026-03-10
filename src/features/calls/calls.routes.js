@@ -68,7 +68,7 @@ router.post('/start', async (req, res) => {
         error: 'Insufficient balance',
         currentBalance: callerBalance,
         requiredBalance,
-        shortfall: requiredBalance - callerBalance
+        shortfall: Math.max(0, requiredBalance - callerBalance)
       });
     }
 
@@ -132,22 +132,25 @@ router.post('/complete', async (req, res) => {
 
     logger.info(`Completing call: ${finalCallId}`);
 
-    // Idempotency: check if call already completed in Firestore
+    // Idempotency: only skip if SERVER already billed this call
+    // (billingSource === 'server' means coins were already deducted)
     const db = getFirestore();
     if (db) {
       try {
         const existingCall = await db.collection('calls').doc(finalCallId).get();
-        if (existingCall.exists && existingCall.data().status === 'completed') {
+        if (existingCall.exists) {
           const existing = existingCall.data();
-          logger.info(`Call ${finalCallId} already completed — returning cached result`);
-          return res.json({
-            success: true, callId: finalCallId,
-            durationSeconds: existing.durationSeconds || 0,
-            coinsDeducted: existing.coinsDeducted || 0,
-            newBalance: null, source: 'already_completed',
-            duplicate: true,
-            message: 'Call was already completed'
-          });
+          if (existing.status === 'completed' && existing.billingSource === 'server') {
+            logger.info(`Call ${finalCallId} already billed by server — returning cached result`);
+            return res.json({
+              success: true, callId: finalCallId,
+              durationSeconds: existing.durationSeconds || 0,
+              coinsDeducted: existing.coinsDeducted || 0,
+              newBalance: null, source: 'already_completed',
+              duplicate: true,
+              message: 'Call was already completed and billed'
+            });
+          }
         }
       } catch (err) {
         logger.warn(`Idempotency check failed for ${finalCallId}: ${err.message}`);
@@ -314,7 +317,7 @@ router.post('/complete', async (req, res) => {
       await db.collection('admin_analytics').doc('call_stats').set({
         totalCalls: admin.firestore.FieldValue.increment(1),
         totalDurationSeconds: admin.firestore.FieldValue.increment(serverDuration),
-        totalCoinsDeducted: admin.firestore.FieldValue.increment(coinsDeducted),
+        totalCoinsDeducted: admin.firestore.FieldValue.increment(actualDeduction),
         lastUpdated: admin.firestore.FieldValue.serverTimestamp()
       }, { merge: true });
     } catch (err) {
@@ -327,9 +330,26 @@ router.post('/complete', async (req, res) => {
     setUserStatus(serverTimer.callerId, { status: 'available', currentCallId: null, lastStatusChange: new Date() });
     setUserStatus(serverTimer.recipientId, { status: 'available', currentCallId: null, lastStatusChange: new Date() });
 
+    // Notify participants that call ended
+    const io = req.app.get('io');
+    if (io) {
+      [serverTimer.callerId, serverTimer.recipientId].forEach(uid => {
+        const conn = getConnectedUser(uid);
+        if (conn && conn.isOnline) {
+          io.to(conn.socketId).emit('call_ended', {
+            callId: finalCallId,
+            durationSeconds: serverDuration,
+            coinsDeducted: actualDeduction,
+            endReason: endReason || 'User ended call',
+            timestamp: new Date().toISOString()
+          });
+        }
+      });
+    }
+
     res.json({
       success: true, callId: finalCallId,
-      durationSeconds: serverDuration, coinsDeducted,
+      durationSeconds: serverDuration, coinsDeducted: actualDeduction,
       newBalance, coinRate: serverTimer.coinRate,
       callType: serverTimer.callType, source: 'server',
       fraudDetection,

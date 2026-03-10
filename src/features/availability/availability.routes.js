@@ -193,9 +193,11 @@ router.get('/get_available_females', async (req, res) => {
       const userData = doc.data();
       const userId = doc.id;
 
-      // Check WebSocket connection
+      // Check WebSocket connection - REQUIRED for browse
       const userConnection = getConnectedUser(userId);
       const hasActiveConnection = userConnection && userConnection.isOnline;
+
+      if (!hasActiveConnection) continue; // Skip offline females entirely
 
       let isSocketConnected = false;
       if (hasActiveConnection) {
@@ -203,11 +205,15 @@ router.get('/get_available_females', async (req, res) => {
         isSocketConnected = userSocket && userSocket.connected;
       }
 
+      if (!isSocketConnected) continue; // Skip if socket not actually connected
+
       if (userData.isAvailable !== true) continue;
 
-      // Skip if busy
+      // Determine status (available or busy)
       const userStatusData = getUserStatus(userId);
-      if (userStatusData && userStatusData.status === 'busy') continue;
+      const isBusy = userStatusData && userStatusData.status === 'busy';
+      const status = isBusy ? 'busy' : 'available';
+      const currentCallId = isBusy ? userStatusData.currentCallId : null;
 
       // Get stats
       let powerUpStats = { rating: 0, totalCalls: 0, totalLikes: 0 };
@@ -236,8 +242,10 @@ router.get('/get_available_females', async (req, res) => {
         age: userData.age || 0,
         photoUrl: userData.photoUrl || '',
         fullPhotoUrl: userData.fullPhotoUrl || userData.photoUrl || '',
-        isOnline: isSocketConnected,
+        isOnline: true, // Always true since we filtered above
         isAvailable: true,
+        status, // 'available' or 'busy'
+        currentCallId,
         rating: powerUpStats.rating,
         totalCalls: powerUpStats.totalCalls,
         totalLikes: powerUpStats.totalLikes,

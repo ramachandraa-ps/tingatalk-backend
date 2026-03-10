@@ -61,6 +61,10 @@ export function createApp() {
   app.use('/api/health', healthRoutes);
   app.use('/api/auth', authRoutes);
   app.use('/api/packages', packagesRoutes);
+  // Pre-call validation routes (Flutter doesn't send auth headers)
+  app.use('/api', callsStandaloneRoutes);
+  // Availability routes (Flutter doesn't send auth headers)
+  app.use('/api', availabilityRoutes);
 
   // --- Admin routes (before catch-all /api auth routes) ---
   app.use('/api/diagnostic', diagnosticsRoutes);
@@ -70,8 +74,6 @@ export function createApp() {
   app.use('/api/calls', authenticate, callsRoutes);
   app.use('/api/payments', authenticate, paymentsRoutes);
   app.use('/api/rewards', authenticate, rewardsRoutes);
-  app.use('/api', authenticate, availabilityRoutes);
-  app.use('/api', authenticate, callsStandaloneRoutes);
   app.use('/api', authenticate, payoutsRoutes);
   app.use('/api', authenticate, statsRoutes);
 
