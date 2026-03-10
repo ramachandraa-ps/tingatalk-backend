@@ -6,7 +6,71 @@ import { getFirestore } from '../../config/firebase.js';
 
 const router = Router();
 
-// POST /api/razorpay/contact-sync
+/**
+ * @openapi
+ * /api/contact-sync:
+ *   post:
+ *     tags:
+ *       - Payouts
+ *     summary: Sync payout contact and fund account with Razorpay
+ *     description: Creates or reuses a Razorpay Contact and Fund Account for a user. Supports both bank account and UPI payment methods. Persists the Razorpay IDs to the user's Firestore document for future reuse.
+ *     security:
+ *       - BearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - userId
+ *               - accountHolderName
+ *             properties:
+ *               userId:
+ *                 type: string
+ *               userName:
+ *                 type: string
+ *               phoneNumber:
+ *                 type: string
+ *               accountHolderName:
+ *                 type: string
+ *               accountNumber:
+ *                 type: string
+ *                 description: Required if upiId is not provided
+ *               ifsc:
+ *                 type: string
+ *               bankName:
+ *                 type: string
+ *               upiId:
+ *                 type: string
+ *                 description: Required if accountNumber is not provided
+ *               accountType:
+ *                 type: string
+ *                 default: savings
+ *               existingContactId:
+ *                 type: string
+ *               existingFundAccountId:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Contact and fund account synced
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 contactId:
+ *                   type: string
+ *                 fundAccountId:
+ *                   type: string
+ *                 status:
+ *                   type: string
+ *                   example: verified
+ *       400:
+ *         description: Missing required payout fields
+ *       500:
+ *         description: Server error
+ */
 router.post('/contact-sync', async (req, res) => {
   try {
     const {
@@ -67,7 +131,60 @@ router.post('/contact-sync', async (req, res) => {
   }
 });
 
-// POST /api/female/payouts
+/**
+ * @openapi
+ * /api/payouts:
+ *   post:
+ *     tags:
+ *       - Payouts
+ *     summary: Trigger a payout to a female user
+ *     description: Creates a Razorpay payout to the specified fund account. Uses IMPS transfer mode and queues if balance is low.
+ *     security:
+ *       - BearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - fundAccountId
+ *               - amount
+ *             properties:
+ *               fundAccountId:
+ *                 type: string
+ *               amount:
+ *                 type: number
+ *                 description: Amount in INR (will be converted to paise)
+ *               currency:
+ *                 type: string
+ *                 default: INR
+ *               userId:
+ *                 type: string
+ *               userName:
+ *                 type: string
+ *               purpose:
+ *                 type: string
+ *                 default: payout
+ *     responses:
+ *       200:
+ *         description: Payout triggered
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 payoutId:
+ *                   type: string
+ *                 status:
+ *                   type: string
+ *                 referenceId:
+ *                   type: string
+ *       400:
+ *         description: Missing required fields
+ *       500:
+ *         description: Server error
+ */
 router.post('/payouts', async (req, res) => {
   try {
     const { fundAccountId, amount, currency = 'INR', userId, userName, purpose = 'payout' } = req.body;

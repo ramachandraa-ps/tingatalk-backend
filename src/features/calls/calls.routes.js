@@ -15,9 +15,67 @@ import {
 
 const router = Router();
 
-// ============================================================
-// POST /api/calls/start - Start call with server-side billing
-// ============================================================
+/**
+ * @openapi
+ * /api/calls/start:
+ *   post:
+ *     tags:
+ *       - Calls
+ *     summary: Start a call with server-side billing
+ *     description: Initiates a call between two users. Validates recipient availability and caller balance, creates a Firestore call record, and starts a server-side billing timer.
+ *     security:
+ *       - BearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - callId
+ *               - callerId
+ *               - recipientId
+ *               - callType
+ *             properties:
+ *               callId:
+ *                 type: string
+ *               callerId:
+ *                 type: string
+ *               recipientId:
+ *                 type: string
+ *               callType:
+ *                 type: string
+ *                 enum: [audio, video]
+ *               roomName:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Call tracking started
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 callId:
+ *                   type: string
+ *                 serverStartTime:
+ *                   type: string
+ *                   format: date-time
+ *                 callerBalance:
+ *                   type: number
+ *                 coinRate:
+ *                   type: number
+ *                 message:
+ *                   type: string
+ *       400:
+ *         description: Missing fields, recipient unavailable, or insufficient balance
+ *       404:
+ *         description: Caller not found
+ *       500:
+ *         description: Server error
+ */
 router.post('/start', async (req, res) => {
   try {
     const { callId, callerId, recipientId, callType, roomName } = req.body;
@@ -114,9 +172,82 @@ router.post('/start', async (req, res) => {
   }
 });
 
-// ============================================================
-// POST /api/calls/complete - Complete call + deduct coins
-// ============================================================
+/**
+ * @openapi
+ * /api/calls/complete:
+ *   post:
+ *     tags:
+ *       - Calls
+ *     summary: Complete a call and deduct coins
+ *     description: Ends an active call, deducts coins from the caller based on server-tracked duration, records female earnings, creates spend transactions, and notifies participants via WebSocket. Supports idempotency and fraud detection.
+ *     security:
+ *       - BearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - callId
+ *             properties:
+ *               callId:
+ *                 type: string
+ *               call_id:
+ *                 type: string
+ *                 description: Alternative field name for callId
+ *               callerId:
+ *                 type: string
+ *               caller_id:
+ *                 type: string
+ *               recipientId:
+ *                 type: string
+ *               recipient_id:
+ *                 type: string
+ *               endReason:
+ *                 type: string
+ *               client_duration_seconds:
+ *                 type: number
+ *                 description: Client-reported duration for fraud detection
+ *               client_coins_deducted:
+ *                 type: number
+ *                 description: Client-reported deduction for fallback
+ *     responses:
+ *       200:
+ *         description: Call completed and billed
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 callId:
+ *                   type: string
+ *                 durationSeconds:
+ *                   type: integer
+ *                 coinsDeducted:
+ *                   type: number
+ *                 newBalance:
+ *                   type: number
+ *                   nullable: true
+ *                 coinRate:
+ *                   type: number
+ *                 callType:
+ *                   type: string
+ *                 source:
+ *                   type: string
+ *                   enum: [server, client_fallback, already_completed]
+ *                 fraudDetection:
+ *                   type: object
+ *                   nullable: true
+ *                 message:
+ *                   type: string
+ *       400:
+ *         description: Missing callId
+ *       500:
+ *         description: Server error
+ */
 router.post('/complete', async (req, res) => {
   try {
     const {
@@ -364,9 +495,57 @@ router.post('/complete', async (req, res) => {
   }
 });
 
-// ============================================================
-// POST /api/calls/heartbeat
-// ============================================================
+/**
+ * @openapi
+ * /api/calls/heartbeat:
+ *   post:
+ *     tags:
+ *       - Calls
+ *     summary: Send a call heartbeat
+ *     description: Updates the last heartbeat timestamp for an active call and returns current duration and estimated cost.
+ *     security:
+ *       - BearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - callId
+ *             properties:
+ *               callId:
+ *                 type: string
+ *               userId:
+ *                 type: string
+ *               callerId:
+ *                 type: string
+ *                 description: Alternative field name for userId
+ *     responses:
+ *       200:
+ *         description: Heartbeat acknowledged
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 callId:
+ *                   type: string
+ *                 currentDurationSeconds:
+ *                   type: integer
+ *                 estimatedCost:
+ *                   type: number
+ *                 coinRate:
+ *                   type: number
+ *       400:
+ *         description: Missing required fields
+ *       404:
+ *         description: Call not found
+ *       500:
+ *         description: Server error
+ */
 router.post('/heartbeat', async (req, res) => {
   try {
     const { callId, userId, callerId } = req.body;
@@ -393,9 +572,48 @@ router.post('/heartbeat', async (req, res) => {
   }
 });
 
-// ============================================================
-// GET /api/call/:callId
-// ============================================================
+/**
+ * @openapi
+ * /api/calls/{callId}:
+ *   get:
+ *     tags:
+ *       - Calls
+ *     summary: Get active call details
+ *     description: Returns the current state of an active call including server-tracked duration and coin rate.
+ *     security:
+ *       - BearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: callId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: The call ID
+ *     responses:
+ *       200:
+ *         description: Call details
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 callId:
+ *                   type: string
+ *                 callerId:
+ *                   type: string
+ *                 recipientId:
+ *                   type: string
+ *                 callType:
+ *                   type: string
+ *                 status:
+ *                   type: string
+ *                 server_duration_seconds:
+ *                   type: integer
+ *                 server_coin_rate:
+ *                   type: number
+ *       404:
+ *         description: Call not found
+ */
 router.get('/:callId', (req, res) => {
   const { callId } = req.params;
   const call = getActiveCall(callId);

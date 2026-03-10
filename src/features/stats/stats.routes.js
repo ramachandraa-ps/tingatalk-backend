@@ -15,6 +15,70 @@ function getStatsSync() {
   return statsSync;
 }
 
+/**
+ * @openapi
+ * /api/refresh_user_stats:
+ *   post:
+ *     tags:
+ *       - Stats
+ *     summary: Refresh stats for a single user
+ *     description: Fetches and returns the latest stats (rating, total calls, likes, dislikes) for a user, and runs a consistency check between data sources.
+ *     security:
+ *       - BearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - user_id
+ *             properties:
+ *               user_id:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: User stats refreshed
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 user_id:
+ *                   type: string
+ *                 stats:
+ *                   type: object
+ *                   properties:
+ *                     rating:
+ *                       type: number
+ *                     totalCalls:
+ *                       type: integer
+ *                     totalLikes:
+ *                       type: integer
+ *                     totalDislikes:
+ *                       type: integer
+ *                     source:
+ *                       type: string
+ *                 consistency_check:
+ *                   type: object
+ *                   properties:
+ *                     is_consistent:
+ *                       type: boolean
+ *                     checked_at:
+ *                       type: string
+ *                       format: date-time
+ *                 timestamp:
+ *                   type: string
+ *                   format: date-time
+ *       400:
+ *         description: Missing user_id
+ *       503:
+ *         description: Stats sync service not available
+ *       500:
+ *         description: Server error
+ */
 router.post('/refresh_user_stats', async (req, res) => {
   try {
     const { user_id } = req.body;
@@ -45,6 +109,52 @@ router.post('/refresh_user_stats', async (req, res) => {
   }
 });
 
+/**
+ * @openapi
+ * /api/batch_refresh_stats:
+ *   post:
+ *     tags:
+ *       - Stats
+ *     summary: Batch refresh stats for multiple users
+ *     description: Refreshes stats for multiple users in a single request. Limited to a maximum number of users per batch.
+ *     security:
+ *       - BearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - user_ids
+ *             properties:
+ *               user_ids:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *                 description: Array of user IDs to refresh stats for
+ *     responses:
+ *       200:
+ *         description: Batch stats refreshed
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 batch_results:
+ *                   type: object
+ *                 timestamp:
+ *                   type: string
+ *                   format: date-time
+ *       400:
+ *         description: Missing or invalid user_ids array, or exceeds max batch size
+ *       503:
+ *         description: Stats sync service not available
+ *       500:
+ *         description: Server error
+ */
 router.post('/batch_refresh_stats', async (req, res) => {
   try {
     const { user_ids } = req.body;

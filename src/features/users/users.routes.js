@@ -4,6 +4,50 @@ import { logger } from '../../utils/logger.js';
 
 const router = Router();
 
+/**
+ * @openapi
+ * /api/user/{userId}/balance:
+ *   get:
+ *     tags:
+ *       - Users
+ *     summary: Get user coin balance
+ *     description: Returns the current coin balance for the specified user.
+ *     security:
+ *       - BearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: userId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: The user ID
+ *     responses:
+ *       200:
+ *         description: User balance retrieved
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 userId:
+ *                   type: string
+ *                 balance:
+ *                   type: number
+ *                 currency:
+ *                   type: string
+ *                   example: coins
+ *                 timestamp:
+ *                   type: string
+ *                   format: date-time
+ *       400:
+ *         description: Missing userId
+ *       404:
+ *         description: User not found
+ *       500:
+ *         description: Server error
+ */
 router.get('/:userId/balance', async (req, res) => {
   try {
     const { userId } = req.params;

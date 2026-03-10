@@ -4,6 +4,59 @@ import { logger } from '../../utils/logger.js';
 
 const router = Router();
 
+/**
+ * @openapi
+ * /api/auth/check-user:
+ *   post:
+ *     tags:
+ *       - Auth
+ *     summary: Check if a user exists by phone number
+ *     description: Looks up a user in Firestore by phone number and returns basic profile info if found.
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - phoneNumber
+ *             properties:
+ *               phoneNumber:
+ *                 type: string
+ *                 description: Phone number to look up (digits only, min 10)
+ *                 example: "9876543210"
+ *     responses:
+ *       200:
+ *         description: User existence check result
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 exists:
+ *                   type: boolean
+ *                 user:
+ *                   type: object
+ *                   nullable: true
+ *                   properties:
+ *                     userId:
+ *                       type: string
+ *                     name:
+ *                       type: string
+ *                       nullable: true
+ *                     gender:
+ *                       type: string
+ *                       nullable: true
+ *                     isVerified:
+ *                       type: boolean
+ *                     profileImageUrl:
+ *                       type: string
+ *                       nullable: true
+ *       400:
+ *         description: Invalid or missing phone number
+ *       500:
+ *         description: Server error
+ */
 router.post('/check-user', async (req, res) => {
   try {
     const { phoneNumber } = req.body;

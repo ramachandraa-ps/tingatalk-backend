@@ -18,12 +18,16 @@ const swaggerDefinition = {
   },
   servers: [
     {
-      url: `http://localhost:${config.port}`,
-      description: 'Local development'
+      url: 'https://staging-api.tingatalk.in',
+      description: 'Staging'
     },
     {
       url: 'https://api.tingatalk.in',
       description: 'Production'
+    },
+    {
+      url: `http://localhost:${config.port}`,
+      description: 'Local development'
     }
   ],
   components: {
@@ -57,6 +61,10 @@ export function getSwaggerSpec() {
 }
 
 export function setupSwagger(app) {
+  if (process.env.ENABLE_SWAGGER !== 'true') {
+    return; // Swagger disabled — production safety
+  }
+
   const spec = getSwaggerSpec();
   app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(spec, {
     customCss: '.swagger-ui .topbar { display: none }',

@@ -5,6 +5,52 @@ import { DAILY_REWARD_COINS } from '../../shared/constants.js';
 
 const router = Router();
 
+/**
+ * @openapi
+ * /api/rewards/daily-claim:
+ *   post:
+ *     tags:
+ *       - Rewards
+ *     summary: Claim daily reward coins
+ *     description: Claims the daily coin reward for the authenticated user. Tracks streaks (consecutive days claimed) and prevents double-claiming on the same UTC day using a Firestore transaction.
+ *     security:
+ *       - BearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Daily reward claimed successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 coinsCredited:
+ *                   type: integer
+ *                 transactionId:
+ *                   type: string
+ *                 currentStreak:
+ *                   type: integer
+ *                 highestStreak:
+ *                   type: integer
+ *                 streakBroken:
+ *                   type: boolean
+ *                 isFirstTime:
+ *                   type: boolean
+ *                 newBalance:
+ *                   type: number
+ *                 nextClaimTime:
+ *                   type: string
+ *                   format: date-time
+ *       400:
+ *         description: Already claimed today
+ *       401:
+ *         description: Authentication required
+ *       404:
+ *         description: User not found
+ *       500:
+ *         description: Server error
+ */
 router.post('/daily-claim', async (req, res) => {
   try {
     const userId = req.authenticatedUserId;

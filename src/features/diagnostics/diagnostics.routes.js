@@ -7,6 +7,69 @@ import {
 
 const router = Router();
 
+/**
+ * @openapi
+ * /api/diagnostic/connections:
+ *   get:
+ *     tags:
+ *       - Diagnostics
+ *     summary: Get full connection diagnostics
+ *     description: Returns detailed diagnostics including all connected users, user statuses, active calls, and socket room assignments. Requires admin API key.
+ *     security:
+ *       - AdminApiKey: []
+ *     responses:
+ *       200:
+ *         description: Connection diagnostics
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 timestamp:
+ *                   type: string
+ *                   format: date-time
+ *                 totalSocketsConnected:
+ *                   type: integer
+ *                 connectedUsers:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       userId:
+ *                         type: string
+ *                       socketId:
+ *                         type: string
+ *                       userType:
+ *                         type: string
+ *                       isOnline:
+ *                         type: boolean
+ *                       socketExists:
+ *                         type: boolean
+ *                       rooms:
+ *                         type: array
+ *                         items:
+ *                           type: string
+ *                       connectedAt:
+ *                         type: string
+ *                 userStatus:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                 activeCalls:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                 socketRooms:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *       403:
+ *         description: Invalid admin API key
+ *       503:
+ *         description: Admin API key not configured
+ *       500:
+ *         description: Server error
+ */
 router.get('/connections', adminAuth, (req, res) => {
   try {
     const io = req.app.get('io');
@@ -61,6 +124,68 @@ router.get('/connections', adminAuth, (req, res) => {
   }
 });
 
+/**
+ * @openapi
+ * /api/diagnostic/user/{userId}:
+ *   get:
+ *     tags:
+ *       - Diagnostics
+ *     summary: Get diagnostics for a specific user
+ *     description: Returns connection and status diagnostics for a single user, including socket state, room membership, and call status. Requires admin API key.
+ *     security:
+ *       - AdminApiKey: []
+ *     parameters:
+ *       - in: path
+ *         name: userId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: The user ID to diagnose
+ *     responses:
+ *       200:
+ *         description: User diagnostics
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 userId:
+ *                   type: string
+ *                 isConnected:
+ *                   type: boolean
+ *                 socketId:
+ *                   type: string
+ *                 userType:
+ *                   type: string
+ *                 socketExists:
+ *                   type: boolean
+ *                 rooms:
+ *                   type: array
+ *                   items:
+ *                     type: string
+ *                 expectedRoom:
+ *                   type: string
+ *                 isInExpectedRoom:
+ *                   type: boolean
+ *                 status:
+ *                   type: string
+ *                 currentCallId:
+ *                   type: string
+ *                   nullable: true
+ *                 connectedAt:
+ *                   type: string
+ *                 timestamp:
+ *                   type: string
+ *                   format: date-time
+ *       403:
+ *         description: Invalid admin API key
+ *       404:
+ *         description: User not found
+ *       503:
+ *         description: Admin API key not configured
+ *       500:
+ *         description: Server error
+ */
 router.get('/user/:userId', adminAuth, (req, res) => {
   try {
     const { userId } = req.params;

@@ -8,7 +8,51 @@ import { StatsSyncUtil } from '../../utils/statsSyncUtil.js';
 
 const router = Router();
 
-// POST /api/check_availability
+/**
+ * @openapi
+ * /api/check_availability:
+ *   post:
+ *     tags:
+ *       - Availability
+ *     summary: Check if a recipient is available for a call
+ *     description: Checks the real-time availability of a user by verifying their WebSocket connection and status. Returns availability state including busy/available/unavailable.
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - recipient_id
+ *             properties:
+ *               recipient_id:
+ *                 type: string
+ *                 description: ID of the user to check availability for
+ *     responses:
+ *       200:
+ *         description: Availability check result
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 is_available:
+ *                   type: boolean
+ *                 user_status:
+ *                   type: string
+ *                   enum: [available, unavailable, busy, ringing]
+ *                 current_call_id:
+ *                   type: string
+ *                   nullable: true
+ *                 message:
+ *                   type: string
+ *       400:
+ *         description: Missing recipient_id
+ *       500:
+ *         description: Server error
+ */
 router.post('/check_availability', async (req, res) => {
   try {
     const { recipient_id } = req.body;
@@ -76,7 +120,57 @@ router.post('/check_availability', async (req, res) => {
   }
 });
 
-// POST /api/update_availability
+/**
+ * @openapi
+ * /api/update_availability:
+ *   post:
+ *     tags:
+ *       - Availability
+ *     summary: Update a user's availability status
+ *     description: Sets a user's availability for receiving calls. Persists the preference to Firestore, notifies the user via WebSocket, and broadcasts changes for female users.
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - user_id
+ *               - is_available
+ *             properties:
+ *               user_id:
+ *                 type: string
+ *                 description: ID of the user to update
+ *               is_available:
+ *                 type: boolean
+ *                 description: Whether the user should be available for calls
+ *     responses:
+ *       200:
+ *         description: Availability updated successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 user_id:
+ *                   type: string
+ *                 is_available:
+ *                   type: boolean
+ *                 status:
+ *                   type: string
+ *                   enum: [available, unavailable]
+ *                 message:
+ *                   type: string
+ *                 timestamp:
+ *                   type: string
+ *                   format: date-time
+ *       400:
+ *         description: Missing required fields or cannot set unavailable while busy
+ *       500:
+ *         description: Server error
+ */
 router.post('/update_availability', async (req, res) => {
   try {
     const { user_id, is_available } = req.body;
@@ -164,7 +258,65 @@ router.post('/update_availability', async (req, res) => {
   }
 });
 
-// GET /api/get_available_females
+/**
+ * @openapi
+ * /api/get_available_females:
+ *   get:
+ *     tags:
+ *       - Availability
+ *     summary: List available female users
+ *     description: Returns all verified female users who are online, have an active WebSocket connection, and are available for calls. Includes stats like rating, total calls, and total likes.
+ *     responses:
+ *       200:
+ *         description: List of available female users
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 available_females:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       userId:
+ *                         type: string
+ *                       name:
+ *                         type: string
+ *                       age:
+ *                         type: integer
+ *                       photoUrl:
+ *                         type: string
+ *                       fullPhotoUrl:
+ *                         type: string
+ *                       isOnline:
+ *                         type: boolean
+ *                       isAvailable:
+ *                         type: boolean
+ *                       status:
+ *                         type: string
+ *                         enum: [available, busy]
+ *                       currentCallId:
+ *                         type: string
+ *                         nullable: true
+ *                       rating:
+ *                         type: number
+ *                       totalCalls:
+ *                         type: integer
+ *                       totalLikes:
+ *                         type: integer
+ *                       relationshipStatus:
+ *                         type: string
+ *                 count:
+ *                   type: integer
+ *                 timestamp:
+ *                   type: string
+ *                   format: date-time
+ *       500:
+ *         description: Server error
+ */
 router.get('/get_available_females', async (req, res) => {
   try {
     const db = getFirestore();

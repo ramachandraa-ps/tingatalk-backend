@@ -6,6 +6,74 @@ import { getFirestore } from '../../config/firebase.js';
 
 const router = Router();
 
+/**
+ * @openapi
+ * /api/health:
+ *   get:
+ *     tags:
+ *       - Health
+ *     summary: Health check
+ *     description: Returns server health status including Redis, Firestore connectivity, memory usage, uptime, and active connection stats.
+ *     responses:
+ *       200:
+ *         description: Server health information
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 status:
+ *                   type: string
+ *                   example: OK
+ *                 timestamp:
+ *                   type: string
+ *                   format: date-time
+ *                 activeCalls:
+ *                   type: integer
+ *                 connectedUsers:
+ *                   type: integer
+ *                 busyUsers:
+ *                   type: integer
+ *                 clustering:
+ *                   type: object
+ *                   properties:
+ *                     enabled:
+ *                       type: boolean
+ *                     instanceId:
+ *                       type: string
+ *                     processId:
+ *                       type: integer
+ *                 infrastructure:
+ *                   type: object
+ *                   properties:
+ *                     redis:
+ *                       type: string
+ *                     firestore:
+ *                       type: string
+ *                 serverInfo:
+ *                   type: object
+ *                   properties:
+ *                     port:
+ *                       type: integer
+ *                     host:
+ *                       type: string
+ *                     nodeVersion:
+ *                       type: string
+ *                     uptime:
+ *                       type: integer
+ *                     uptimeFormatted:
+ *                       type: string
+ *                     memoryUsage:
+ *                       type: object
+ *                     environment:
+ *                       type: string
+ *                     pid:
+ *                       type: integer
+ *                     platform:
+ *                       type: string
+ *                     arch:
+ *                       type: string
+ */
 router.get('/', async (req, res) => {
   const memoryUsage = process.memoryUsage();
   const uptime = process.uptime();

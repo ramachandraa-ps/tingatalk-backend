@@ -9,7 +9,57 @@ import { COIN_RATES, MIN_BALANCE, MIN_CALL_DURATION_SECONDS, ENDED_CALL_STATUSES
 
 const router = Router();
 
-// POST /api/check_call_status
+/**
+ * @openapi
+ * /api/check_call_status:
+ *   post:
+ *     tags:
+ *       - Calls
+ *     summary: Check the status of a call
+ *     description: Checks whether a call is active, ringing, connected, or ended. Looks up the call in in-memory state first, then falls back to Firestore.
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - call_id
+ *             properties:
+ *               call_id:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Call status result
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 call_active:
+ *                   type: boolean
+ *                 call_status:
+ *                   type: string
+ *                 is_ringing:
+ *                   type: boolean
+ *                 is_connected:
+ *                   type: boolean
+ *                 is_ended:
+ *                   type: boolean
+ *                 ended_reason:
+ *                   type: string
+ *                   nullable: true
+ *                 call_data:
+ *                   type: object
+ *                 message:
+ *                   type: string
+ *       400:
+ *         description: Missing call_id
+ *       500:
+ *         description: Server error
+ */
 router.post('/check_call_status', async (req, res) => {
   try {
     const { call_id } = req.body;
@@ -77,7 +127,62 @@ router.post('/check_call_status', async (req, res) => {
   }
 });
 
-// POST /api/validate_balance
+/**
+ * @openapi
+ * /api/validate_balance:
+ *   post:
+ *     tags:
+ *       - Calls
+ *     summary: Validate user balance for a call
+ *     description: Checks if a user has sufficient coin balance to start a call of the specified type. Returns balance details and minimum requirements.
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - user_id
+ *               - call_type
+ *             properties:
+ *               user_id:
+ *                 type: string
+ *               call_type:
+ *                 type: string
+ *                 enum: [audio, video]
+ *     responses:
+ *       200:
+ *         description: Balance validation result
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 has_sufficient_balance:
+ *                   type: boolean
+ *                 current_balance:
+ *                   type: number
+ *                 required_balance:
+ *                   type: number
+ *                 shortfall:
+ *                   type: number
+ *                 coin_rate_per_second:
+ *                   type: number
+ *                 minimum_duration_seconds:
+ *                   type: integer
+ *                 call_type:
+ *                   type: string
+ *                 message:
+ *                   type: string
+ *       400:
+ *         description: Missing required fields
+ *       404:
+ *         description: User not found
+ *       500:
+ *         description: Server error
+ */
 router.post('/validate_balance', async (req, res) => {
   try {
     const { user_id, call_type } = req.body;
@@ -123,7 +228,62 @@ router.post('/validate_balance', async (req, res) => {
   }
 });
 
-// POST /api/generate_token
+/**
+ * @openapi
+ * /api/generate_token:
+ *   post:
+ *     tags:
+ *       - Calls
+ *     summary: Generate a Twilio access token
+ *     description: Generates a Twilio Video/Audio access token for a user to join a room. Token expires in 30 minutes.
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - user_identity
+ *               - room_name
+ *             properties:
+ *               user_identity:
+ *                 type: string
+ *                 description: Unique user identity for the token
+ *               room_name:
+ *                 type: string
+ *                 description: "Room name in format: (video|audio)_userIds"
+ *               is_video:
+ *                 type: boolean
+ *                 default: true
+ *     responses:
+ *       200:
+ *         description: Access token generated
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 accessToken:
+ *                   type: string
+ *                 room_name:
+ *                   type: string
+ *                 user_identity:
+ *                   type: string
+ *                 is_video:
+ *                   type: boolean
+ *                 coin_rate_per_second:
+ *                   type: number
+ *                 expiresAt:
+ *                   type: string
+ *                   format: date-time
+ *                 server_timestamp:
+ *                   type: string
+ *                   format: date-time
+ *       400:
+ *         description: Missing fields or invalid room_name format
+ *       500:
+ *         description: Server error
+ */
 router.post('/generate_token', async (req, res) => {
   try {
     const { user_identity, room_name, is_video = true } = req.body;
@@ -154,7 +314,62 @@ router.post('/generate_token', async (req, res) => {
   }
 });
 
-// POST /api/start_call_tracking (LEGACY)
+/**
+ * @openapi
+ * /api/start_call_tracking:
+ *   post:
+ *     tags:
+ *       - Calls
+ *     summary: Start server-side call tracking (legacy)
+ *     description: "[LEGACY] Starts a server-side timer for call billing. Use POST /api/calls/start instead."
+ *     deprecated: true
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - call_id
+ *               - caller_id
+ *               - recipient_id
+ *               - call_type
+ *             properties:
+ *               call_id:
+ *                 type: string
+ *               caller_id:
+ *                 type: string
+ *               recipient_id:
+ *                 type: string
+ *               call_type:
+ *                 type: string
+ *                 enum: [audio, video]
+ *               room_name:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Call tracking started
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 call_id:
+ *                   type: string
+ *                 coin_rate_per_second:
+ *                   type: number
+ *                 server_start_time:
+ *                   type: string
+ *                   format: date-time
+ *                 message:
+ *                   type: string
+ *       400:
+ *         description: Missing required fields
+ *       500:
+ *         description: Server error
+ */
 router.post('/start_call_tracking', async (req, res) => {
   try {
     const { call_id, caller_id, recipient_id, call_type, room_name } = req.body;
@@ -198,7 +413,71 @@ router.post('/start_call_tracking', async (req, res) => {
   }
 });
 
-// POST /api/complete_call (LEGACY)
+/**
+ * @openapi
+ * /api/complete_call:
+ *   post:
+ *     tags:
+ *       - Calls
+ *     summary: Complete a call and get billing info (legacy)
+ *     description: "[LEGACY] Stops the server-side timer and returns billing information. Use POST /api/calls/complete instead."
+ *     deprecated: true
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - call_id
+ *             properties:
+ *               call_id:
+ *                 type: string
+ *               client_duration_seconds:
+ *                 type: number
+ *                 description: Client-reported duration for fraud detection
+ *               client_coins_deducted:
+ *                 type: number
+ *                 description: Client-reported deduction for fallback
+ *     responses:
+ *       200:
+ *         description: Call completed
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 call_id:
+ *                   type: string
+ *                 duration_seconds:
+ *                   type: integer
+ *                 coins_deducted:
+ *                   type: number
+ *                 coin_rate_per_second:
+ *                   type: number
+ *                 call_type:
+ *                   type: string
+ *                 source:
+ *                   type: string
+ *                   enum: [server, client]
+ *                 validation:
+ *                   type: object
+ *                   properties:
+ *                     client_duration:
+ *                       type: number
+ *                     server_duration:
+ *                       type: integer
+ *                     duration_diff_seconds:
+ *                       type: number
+ *                     is_fraudulent:
+ *                       type: boolean
+ *       400:
+ *         description: Missing call_id
+ *       500:
+ *         description: Server error
+ */
 router.post('/complete_call', async (req, res) => {
   try {
     const { call_id, client_duration_seconds, client_coins_deducted } = req.body;

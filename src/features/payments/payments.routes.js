@@ -7,7 +7,61 @@ import { COIN_PACKAGES } from '../../shared/constants.js';
 
 const router = Router();
 
-// POST /api/payments/orders
+/**
+ * @openapi
+ * /api/payments/orders:
+ *   post:
+ *     tags:
+ *       - Payments
+ *     summary: Create a Razorpay order
+ *     description: Creates a Razorpay payment order for a coin package purchase. The authenticated user ID is extracted from the Bearer token.
+ *     security:
+ *       - BearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - packageId
+ *             properties:
+ *               packageId:
+ *                 type: string
+ *                 description: ID of the coin package to purchase
+ *               currency:
+ *                 type: string
+ *                 default: INR
+ *               userName:
+ *                 type: string
+ *               coins:
+ *                 type: integer
+ *               receipt:
+ *                 type: string
+ *               notes:
+ *                 type: object
+ *     responses:
+ *       200:
+ *         description: Razorpay order created
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 order_id:
+ *                   type: string
+ *                 amount:
+ *                   type: integer
+ *                   description: Amount in paise
+ *                 currency:
+ *                   type: string
+ *                 key_id:
+ *                   type: string
+ *       400:
+ *         description: Missing fields or unknown packageId
+ *       500:
+ *         description: Server error
+ */
 router.post('/orders', async (req, res) => {
   try {
     const { currency = 'INR', userName, packageId, coins, receipt, notes } = req.body;
@@ -37,7 +91,64 @@ router.post('/orders', async (req, res) => {
   }
 });
 
-// POST /api/payments/verify
+/**
+ * @openapi
+ * /api/payments/verify:
+ *   post:
+ *     tags:
+ *       - Payments
+ *     summary: Verify a Razorpay payment and credit coins
+ *     description: Verifies the Razorpay payment signature, credits coins to the user in a Firestore transaction, records the transaction, and updates analytics. Supports idempotency via payment_verifications collection.
+ *     security:
+ *       - BearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - orderId
+ *               - paymentId
+ *               - signature
+ *             properties:
+ *               orderId:
+ *                 type: string
+ *               paymentId:
+ *                 type: string
+ *               signature:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Payment verified and coins credited
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 isValid:
+ *                   type: boolean
+ *                 verificationId:
+ *                   type: string
+ *                 paymentId:
+ *                   type: string
+ *                 transactionId:
+ *                   type: string
+ *                 coinsCredited:
+ *                   type: integer
+ *                 newBalance:
+ *                   type: number
+ *                 verifiedAt:
+ *                   type: string
+ *                   format: date-time
+ *                 duplicate:
+ *                   type: boolean
+ *                   description: True if this payment was already verified
+ *       400:
+ *         description: Missing fields, invalid signature, or unknown packageId
+ *       500:
+ *         description: Server error
+ */
 router.post('/verify', async (req, res) => {
   try {
     const { orderId, paymentId, signature } = req.body;
