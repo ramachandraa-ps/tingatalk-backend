@@ -213,22 +213,32 @@ router.post('/complete', async (req, res) => {
     const effectiveCallerId = finalCallerId || serverTimer.callerId;
     const effectiveRecipientId = finalRecipientId || serverTimer.recipientId;
 
-    // Deduct coins
+    // Deduct coins (with negative balance guard)
     if (effectiveCallerId && coinsDeducted > 0) {
       const userRef = db.collection('users').doc(effectiveCallerId);
       const userDoc = await userRef.get();
       const data = userDoc.data() || {};
-      const balanceField = data.coinBalance !== undefined ? 'coinBalance' : 'coins';
-      await userRef.set({
-        [balanceField]: admin.firestore.FieldValue.increment(-coinsDeducted),
-        lastSpendAt: admin.firestore.FieldValue.serverTimestamp()
-      }, { merge: true });
+      const currentBalance = data.coins ?? data.coinBalance ?? 0;
+
+      // Guard: don't deduct more than available
+      const actualDeduction = Math.min(coinsDeducted, Math.max(0, currentBalance));
+
+      if (actualDeduction > 0) {
+        await userRef.update({
+          coins: admin.firestore.FieldValue.increment(-actualDeduction),
+          lastSpendAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+      }
+
+      if (actualDeduction < coinsDeducted) {
+        logger.warn(`Balance guard: User ${effectiveCallerId} had ${currentBalance} coins, tried to deduct ${coinsDeducted}, deducted ${actualDeduction}`);
+      }
     }
 
     const newBalance = await (async () => {
       const doc = await db.collection('users').doc(effectiveCallerId || serverTimer.callerId).get();
       const d = doc.data() || {};
-      return d.coinBalance || d.coins || 0;
+      return d.coins ?? d.coinBalance ?? 0;
     })();
 
     // Update call in Firestore

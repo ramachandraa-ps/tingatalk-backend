@@ -174,11 +174,14 @@ export function registerConnectionHandlers(io, socket) {
                   const userRef = db.collection('users').doc(call.callerId);
                   const userDoc = await userRef.get();
                   const data = userDoc.data() || {};
-                  const balanceField = data.coinBalance !== undefined ? 'coinBalance' : 'coins';
-                  await userRef.set({
-                    [balanceField]: admin.firestore.FieldValue.increment(-coinsDeducted),
-                    lastSpendAt: admin.firestore.FieldValue.serverTimestamp()
-                  }, { merge: true });
+                  const currentBalance = data.coins ?? data.coinBalance ?? 0;
+                  const actualDeduction = Math.min(coinsDeducted, Math.max(0, currentBalance));
+                  if (actualDeduction > 0) {
+                    await userRef.update({
+                      coins: admin.firestore.FieldValue.increment(-actualDeduction),
+                      lastSpendAt: admin.firestore.FieldValue.serverTimestamp()
+                    });
+                  }
                   logger.info(`Deducted ${coinsDeducted} coins from ${call.callerId} for disconnected call`);
                 }
               } catch (deductErr) {
