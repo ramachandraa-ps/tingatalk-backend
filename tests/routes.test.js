@@ -243,12 +243,12 @@ describe('Route Wiring Tests', () => {
   });
 
   describe('GET /api/packages', () => {
-    it('should return all 4 active coin packages', async () => {
+    it('should return all 5 active coin packages', async () => {
       const res = await req('GET', '/api/packages');
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('packages');
       expect(Array.isArray(res.body.packages)).toBe(true);
-      expect(res.body.packages.length).toBe(4);
+      expect(res.body.packages.length).toBe(5);
     });
 
     it('should have correct package structure', async () => {
