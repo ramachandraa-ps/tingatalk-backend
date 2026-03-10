@@ -23,6 +23,7 @@ export const FEMALE_EARNING_RATES = {
 
 // Coin packages — server-authoritative pricing
 export const COIN_PACKAGES = {
+  'basic_pack':    { id: 'basic_pack',    name: 'Basic Pack',    coinAmount: 100,  priceInRupees: 82,   discountPercent: 18, isPopular: false, isActive: true },
   'starter_pack':  { id: 'starter_pack',  name: 'Starter Pack',  coinAmount: 100,  priceInRupees: 99,   discountPercent: 10, isPopular: false, isActive: true },
   'popular_pack':  { id: 'popular_pack',  name: 'Popular Pack',  coinAmount: 500,  priceInRupees: 399,  discountPercent: 20, isPopular: true,  isActive: true },
   'value_pack':    { id: 'value_pack',    name: 'Value Pack',    coinAmount: 1000, priceInRupees: 699,  discountPercent: 30, isPopular: false, isActive: true },

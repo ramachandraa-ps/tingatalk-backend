@@ -8,7 +8,7 @@ describe('Health Check', () => {
     expect(COIN_RATES.video).toBe(1.0);
     expect(MIN_BALANCE.audio).toBe(24);
     expect(MIN_BALANCE.video).toBe(120);
-    expect(Object.keys(COIN_PACKAGES)).toHaveLength(4);
+    expect(Object.keys(COIN_PACKAGES)).toHaveLength(5);
   });
 
   it('should have all coin packages with required fields', async () => {
