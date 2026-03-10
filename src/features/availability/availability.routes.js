@@ -252,7 +252,10 @@ router.get('/get_available_females', async (req, res) => {
       timestamp: new Date().toISOString()
     });
   } catch (error) {
-    logger.error('Error in get_available_females:', error);
+    logger.error('Error in get_available_females:', error.message);
+    if (error.message && error.message.includes('index')) {
+      logger.error('MISSING FIRESTORE INDEX: Deploy indexes with: firebase deploy --only firestore:indexes');
+    }
     res.status(500).json({
       error: 'Failed to fetch available females',
       details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
