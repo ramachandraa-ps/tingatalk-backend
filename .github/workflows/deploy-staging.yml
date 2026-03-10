@@ -1,0 +1,55 @@
+name: Deploy to Staging
+
+on:
+  push:
+    branches: [feature/modular-backend]
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  deploy-staging:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to Staging VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: root
+          password: ${{ secrets.VPS_PASSWORD }}
+          script: |
+            echo "=========================================="
+            echo "Starting TingaTalk STAGING Deployment..."
+            echo "=========================================="
+
+            cd /var/www/tingatalk-new
+
+            echo "Pulling latest changes..."
+            git fetch origin feature/modular-backend
+            git reset --hard origin/feature/modular-backend
+
+            echo "Installing dependencies..."
+            npm install --production
+
+            echo "Restarting PM2 process..."
+            pm2 restart tingatalk-new
+
+            echo "Saving PM2 process list..."
+            pm2 save
+
+            echo "Waiting for startup..."
+            sleep 3
+
+            echo "Health check..."
+            curl -sf http://localhost:3002/api/health | python3 -m json.tool || echo "Health check failed!"
+
+            echo "=========================================="
+            echo "Staging deployment completed!"
+            echo "URL: https://staging-api.tingatalk.in"
+            echo "Swagger: https://staging-api.tingatalk.in/api-docs"
+            echo "=========================================="
+
+            echo "Current PM2 status:"
+            pm2 status
