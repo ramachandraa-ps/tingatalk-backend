@@ -182,7 +182,7 @@ export function registerConnectionHandlers(io, socket) {
                       lastSpendAt: admin.firestore.FieldValue.serverTimestamp()
                     });
                   }
-                  logger.info(`Deducted ${coinsDeducted} coins from ${call.callerId} for disconnected call`);
+                  logger.info(`Deducted ${actualDeduction} coins from ${call.callerId} for disconnected call`);
                 }
               } catch (deductErr) {
                 logger.error(`Failed to deduct coins on disconnect: ${deductErr.message}`);

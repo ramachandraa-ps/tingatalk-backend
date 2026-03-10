@@ -60,7 +60,7 @@ router.post('/start', async (req, res) => {
     if (!userDoc.exists) return res.status(404).json({ error: 'Caller not found' });
 
     const userData = userDoc.data();
-    const callerBalance = userData.coinBalance || userData.coins || 0;
+    const callerBalance = userData.coins ?? userData.coinBalance ?? 0;
     const requiredBalance = callType === 'video' ? MIN_BALANCE.video : MIN_BALANCE.audio;
 
     if (callerBalance < requiredBalance) {
@@ -161,7 +161,6 @@ router.post('/complete', async (req, res) => {
       logger.warn(`No server timer found for call ${finalCallId}`);
 
       if (client_duration_seconds !== undefined) {
-        const db = getFirestore();
         if (db) {
           await db.collection('calls').doc(finalCallId).update({
             status: 'completed', durationSeconds: client_duration_seconds || 0,
@@ -214,6 +213,7 @@ router.post('/complete', async (req, res) => {
     const effectiveRecipientId = finalRecipientId || serverTimer.recipientId;
 
     // Deduct coins (with negative balance guard)
+    let actualDeduction = coinsDeducted;
     if (effectiveCallerId && coinsDeducted > 0) {
       const userRef = db.collection('users').doc(effectiveCallerId);
       const userDoc = await userRef.get();
@@ -221,7 +221,7 @@ router.post('/complete', async (req, res) => {
       const currentBalance = data.coins ?? data.coinBalance ?? 0;
 
       // Guard: don't deduct more than available
-      const actualDeduction = Math.min(coinsDeducted, Math.max(0, currentBalance));
+      actualDeduction = Math.min(coinsDeducted, Math.max(0, currentBalance));
 
       if (actualDeduction > 0) {
         await userRef.update({
@@ -243,7 +243,7 @@ router.post('/complete', async (req, res) => {
 
     // Update call in Firestore
     await db.collection('calls').doc(finalCallId).update({
-      status: 'completed', durationSeconds: serverDuration, coinsDeducted,
+      status: 'completed', durationSeconds: serverDuration, coinsDeducted: actualDeduction,
       endedAt: new Date().toISOString(),
       endReason: endReason || 'User ended call',
       billingSource: 'server', fraudDetection,
@@ -282,12 +282,12 @@ router.post('/complete', async (req, res) => {
     }
 
     // Record spend transaction
-    if (effectiveCallerId && coinsDeducted > 0) {
+    if (effectiveCallerId && actualDeduction > 0) {
       try {
         const spendTxnId = `txn_call_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`;
         const spendTxnData = {
           id: spendTxnId, userId: effectiveCallerId, type: 'spend', status: 'success',
-          coinAmount: coinsDeducted,
+          coinAmount: actualDeduction,
           description: `${serverTimer.callType} call - ${serverDuration}s`,
           createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
           metadata: {
@@ -301,7 +301,7 @@ router.post('/complete', async (req, res) => {
         batch.set(db.collection('users').doc(effectiveCallerId).collection('transactions').doc(spendTxnId), spendTxnData);
         batch.set(db.collection('transactions').doc(spendTxnId), spendTxnData);
         batch.update(db.collection('users').doc(effectiveCallerId), {
-          totalCoinsSpent: admin.firestore.FieldValue.increment(coinsDeducted)
+          totalCoinsSpent: admin.firestore.FieldValue.increment(actualDeduction)
         });
         await batch.commit();
       } catch (err) {
