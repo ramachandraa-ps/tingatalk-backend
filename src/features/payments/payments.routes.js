@@ -15,7 +15,12 @@ router.post('/orders', async (req, res) => {
     if (!userId || !packageId) return res.status(400).json({ error: 'userId and packageId are required' });
 
     const coinPackage = COIN_PACKAGES[packageId];
-    if (!coinPackage) return res.status(400).json({ error: `Unknown packageId: ${packageId}` });
+    if (!coinPackage) {
+      return res.status(400).json({
+        error: `Unknown packageId: ${packageId}`,
+        availablePackages: Object.keys(COIN_PACKAGES)
+      });
+    }
 
     const amountInPaise = Math.round(coinPackage.priceInRupees * 100);
     const order = await razorpayClient.orders.create({
