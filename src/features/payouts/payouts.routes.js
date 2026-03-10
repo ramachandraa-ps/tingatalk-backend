@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { razorpayApi } from '../../config/razorpay.js';
 import { config } from '../../config/index.js';
 import { logger } from '../../utils/logger.js';
+import { getFirestore } from '../../config/firebase.js';
 
 const router = Router();
 
@@ -40,6 +41,20 @@ router.post('/contact-sync', async (req, res) => {
 
       const fundAccount = await razorpayApi.post('/fund_accounts', payload);
       fundAccountId = fundAccount.data.id;
+    }
+
+    // Persist IDs to user document for reuse
+    try {
+      const db = getFirestore();
+      if (db && userId) {
+        await db.collection('users').doc(userId).set({
+          razorpayContactId: contactId,
+          razorpayFundAccountId: fundAccountId,
+          payoutDetailsUpdatedAt: new Date()
+        }, { merge: true });
+      }
+    } catch (persistErr) {
+      logger.warn(`Failed to persist Razorpay IDs: ${persistErr.message}`);
     }
 
     res.json({ contactId, fundAccountId, status: 'verified' });
