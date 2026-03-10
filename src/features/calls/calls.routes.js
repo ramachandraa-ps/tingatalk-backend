@@ -132,6 +132,28 @@ router.post('/complete', async (req, res) => {
 
     logger.info(`Completing call: ${finalCallId}`);
 
+    // Idempotency: check if call already completed in Firestore
+    const db = getFirestore();
+    if (db) {
+      try {
+        const existingCall = await db.collection('calls').doc(finalCallId).get();
+        if (existingCall.exists && existingCall.data().status === 'completed') {
+          const existing = existingCall.data();
+          logger.info(`Call ${finalCallId} already completed — returning cached result`);
+          return res.json({
+            success: true, callId: finalCallId,
+            durationSeconds: existing.durationSeconds || 0,
+            coinsDeducted: existing.coinsDeducted || 0,
+            newBalance: null, source: 'already_completed',
+            duplicate: true,
+            message: 'Call was already completed'
+          });
+        }
+      } catch (err) {
+        logger.warn(`Idempotency check failed for ${finalCallId}: ${err.message}`);
+      }
+    }
+
     const serverTimer = getCallTimer(finalCallId);
 
     // Graceful fallback if no server timer
@@ -187,7 +209,7 @@ router.post('/complete', async (req, res) => {
       }
     }
 
-    const db = getFirestore();
+    // db already declared earlier (idempotency check)
     const effectiveCallerId = finalCallerId || serverTimer.callerId;
     const effectiveRecipientId = finalRecipientId || serverTimer.recipientId;
 
