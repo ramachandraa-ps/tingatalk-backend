@@ -199,7 +199,7 @@ router.post('/validate_balance', async (req, res) => {
     }
 
     const userData = userDoc.data();
-    const actualBalance = userData.coins ?? userData.coinBalance ?? 0;
+    const actualBalance = userData.coins ?? 0;
 
     const isVideo = call_type === 'video';
     const requiredBalance = isVideo ? MIN_BALANCE.video : MIN_BALANCE.audio;

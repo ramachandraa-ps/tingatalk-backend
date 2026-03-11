@@ -14,7 +14,7 @@ export class StatsSyncUtil {
       const fallbackStats = {
         userId,
         rating: userData.rating || 0,
-        totalCalls: userData.totalCallsReceived || 0,
+        totalCalls: userData.totalCalls || 0,
         totalLikes: userData.totalLikes || 0,
         totalDislikes: userData.totalDislikes || 0,
         source: 'main_document'
@@ -64,7 +64,7 @@ export class StatsSyncUtil {
   async updateMainDocumentStats(userId, stats) {
     await this.firestore.collection('users').doc(userId).update({
       rating: stats.rating,
-      totalCallsReceived: stats.totalCalls,
+      totalCalls: stats.totalCalls,
       totalLikes: stats.totalLikes,
       totalDislikes: stats.totalDislikes,
       lastStatsUpdate: new Date(),
@@ -107,7 +107,7 @@ export class StatsSyncUtil {
       const data = doc.data();
       return {
         userId, rating: data.rating || 0,
-        totalCalls: data.totalCallsReceived || 0,
+        totalCalls: data.totalCalls || 0,
         totalLikes: data.totalLikes || 0,
         totalDislikes: data.totalDislikes || 0,
         source: 'main_document'

@@ -144,7 +144,7 @@ router.post('/daily-claim', async (req, res) => {
 
     // Get updated balance
     const updatedDoc = await db.collection('users').doc(userId).get();
-    const newBalance = updatedDoc.data()?.coins ?? updatedDoc.data()?.coinBalance ?? 0;
+    const newBalance = updatedDoc.data()?.coins ?? 0;
 
     res.json({
       success: true, coinsCredited: DAILY_REWARD_COINS, transactionId,
