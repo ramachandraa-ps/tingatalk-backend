@@ -410,6 +410,23 @@ router.post('/complete', async (req, res) => {
           durationSeconds: admin.firestore.FieldValue.increment(serverDuration),
           lastUpdated: admin.firestore.FieldValue.serverTimestamp()
         }, { merge: true });
+
+        // Record individual transaction for female earnings history
+        const femaleTransactionRef = femaleEarningsRef.collection('transactions').doc(finalCallId);
+        await femaleTransactionRef.set({
+          type: 'call_earning',
+          callId: finalCallId,
+          callerId: serverTimer.callerId,
+          callType: serverTimer.callType,
+          isVideoCall: serverTimer.callType === 'video',
+          durationSeconds: serverDuration,
+          amount: earningAmount,
+          currency: 'INR',
+          ratePerSecond: earningRate,
+          completedAt: new Date().toISOString(),
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          status: 'completed'
+        });
       } catch (err) {
         logger.error(`Failed to record female earnings: ${err.message}`);
       }
