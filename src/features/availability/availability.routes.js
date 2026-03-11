@@ -339,6 +339,22 @@ router.get('/get_available_females', async (req, res) => {
     let statsSync = null;
     try { statsSync = new StatsSyncUtil(db); } catch (e) { /* fallback */ }
 
+    // Batch-fetch female_earnings docs for totalCalls (source of truth)
+    const femaleEarningsMap = {};
+    try {
+      const earningsPromises = femalesSnapshot.docs.map(doc =>
+        db.collection('female_earnings').doc(doc.id).get()
+      );
+      const earningsDocs = await Promise.all(earningsPromises);
+      earningsDocs.forEach(edoc => {
+        if (edoc.exists) {
+          femaleEarningsMap[edoc.id] = edoc.data();
+        }
+      });
+    } catch (e) {
+      logger.warn('Failed to batch-fetch female_earnings:', e.message);
+    }
+
     const availableFemales = [];
 
     for (const doc of femalesSnapshot.docs) {
@@ -386,6 +402,12 @@ router.get('/get_available_females', async (req, res) => {
           totalCalls: userData.totalCallsReceived || 0,
           totalLikes: userData.totalLikes || 0
         };
+      }
+
+      // Override totalCalls from female_earnings (source of truth)
+      const femaleEarnings = femaleEarningsMap[userId];
+      if (femaleEarnings && typeof femaleEarnings.totalCalls === 'number') {
+        powerUpStats.totalCalls = femaleEarnings.totalCalls;
       }
 
       availableFemales.push({
