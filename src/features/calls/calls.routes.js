@@ -118,6 +118,7 @@ router.post('/start', async (req, res) => {
     if (!userDoc.exists) return res.status(404).json({ error: 'Caller not found' });
 
     const userData = userDoc.data();
+    const callerName = userData.name || userData.displayName || 'Unknown';
     const callerBalance = userData.coins ?? userData.coinBalance ?? 0;
     const requiredBalance = callType === 'video' ? MIN_BALANCE.video : MIN_BALANCE.audio;
 
@@ -154,7 +155,7 @@ router.post('/start', async (req, res) => {
 
     setCallTimer(callId, {
       interval, durationSeconds: 0, coinRate, callerId, recipientId,
-      callType, startTime, lastHeartbeat: Date.now()
+      callType, callerName, startTime, lastHeartbeat: Date.now()
     });
 
     res.json({
@@ -417,6 +418,7 @@ router.post('/complete', async (req, res) => {
           type: 'call_earning',
           callId: finalCallId,
           callerId: serverTimer.callerId,
+          callerName: serverTimer.callerName || 'Unknown',
           callType: serverTimer.callType,
           isVideoCall: serverTimer.callType === 'video',
           durationSeconds: serverDuration,
