@@ -19,6 +19,7 @@ jobs:
           host: ${{ secrets.VPS_HOST }}
           username: root
           password: ${{ secrets.VPS_PASSWORD }}
+          timeout: 60s
           script: |
             echo "=========================================="
             echo "Starting TingaTalk STAGING Deployment..."
