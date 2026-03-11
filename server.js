@@ -2221,8 +2221,8 @@ app.post('/api/calls/complete', async (req, res) => {
 
         const femaleEarningsRef = scalability.firestore.collection('female_earnings').doc(effectiveRecipientId);
         await femaleEarningsRef.set({
-          totalEarningsINR: admin.firestore.FieldValue.increment(earningAmount),
-          availableBalanceINR: admin.firestore.FieldValue.increment(earningAmount),
+          totalEarnings: admin.firestore.FieldValue.increment(earningAmount),
+          availableBalance: admin.firestore.FieldValue.increment(earningAmount),
           totalCalls: admin.firestore.FieldValue.increment(1),
           totalDurationSeconds: admin.firestore.FieldValue.increment(serverDuration),
           [`total${serverTimer.callType === 'video' ? 'Video' : 'Audio'}Calls`]: admin.firestore.FieldValue.increment(1),
