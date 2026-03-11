@@ -675,10 +675,6 @@ app.post('/api/rewards/daily-claim', async (req, res) => {
           scalability.firestore.collection('users').doc(userId).collection('transactions').doc(transactionId),
           txnData
         );
-        t.set(
-          scalability.firestore.collection('transactions').doc(transactionId),
-          { ...txnData, userDisplayName: userData.name || 'Unknown', userGender: userData.gender || 'unknown' }
-        );
         t.update(userRef, updateData);
       });
     } catch (txnError) {
@@ -986,15 +982,6 @@ app.post('/api/payments/verify', async (req, res) => {
         .collection('transactions').doc(transactionId);
       t.set(userTxnRef, transactionData);
 
-      // Record in global transactions
-      const globalTxnRef = scalability.firestore
-        .collection('transactions').doc(transactionId);
-      t.set(globalTxnRef, {
-        ...transactionData,
-        userDisplayName: userDoc.exists ? (userDoc.data().name || 'Unknown') : 'Unknown',
-        userGender: userDoc.exists ? (userDoc.data().gender || 'unknown') : 'unknown',
-      });
-
       // Record payment verification for idempotency
       const verificationRef = scalability.firestore
         .collection('payment_verifications').doc(orderId);
@@ -1022,19 +1009,6 @@ app.post('/api/payments/verify', async (req, res) => {
       }, { merge: true });
     } catch (analyticsError) {
       logger.warn('⚠️ Admin analytics update failed (non-critical):', analyticsError.message);
-    }
-
-    // Step 6: Update male user tracking (non-critical)
-    try {
-      const adminUserRef = scalability.firestore.collection('male_users_admin').doc(userId);
-      await adminUserRef.set({
-        totalCoinsPurchased: admin.firestore.FieldValue.increment(coinPackage.coinAmount),
-        totalPurchaseCount: admin.firestore.FieldValue.increment(1),
-        totalSpentINR: admin.firestore.FieldValue.increment(coinPackage.priceInRupees),
-        lastPurchaseAt: admin.firestore.FieldValue.serverTimestamp(),
-      }, { merge: true });
-    } catch (trackingError) {
-      logger.warn('⚠️ Male user tracking failed (non-critical):', trackingError.message);
     }
 
     logger.info(`✅ Payment verified and coins credited: ${coinPackage.coinAmount} coins to user ${userId}`);
@@ -1617,7 +1591,7 @@ app.get('/api/get_available_females', async (req, res) => {
           
           const fallbackStats = {
             rating: userData.rating || 0,
-            totalCalls: userData.totalCallsReceived || 0,
+            totalCalls: userData.totalCalls || 0,
             totalLikes: userData.totalLikes || 0
           };
 
@@ -1657,7 +1631,7 @@ app.get('/api/get_available_females', async (req, res) => {
         // Final fallback to main document data
         powerUpStats = {
           rating: userData.rating || 0,
-          totalCalls: userData.totalCallsReceived || 0,
+          totalCalls: userData.totalCalls || 0,
           totalLikes: userData.totalLikes || 0
         };
         logger.error(`❌ StatsSyncUtil failed for user ${userId}, using main document data:`, utilError.message);
@@ -2298,10 +2272,6 @@ app.post('/api/calls/complete', async (req, res) => {
         const batch = scalability.firestore.batch();
         batch.set(
           scalability.firestore.collection('users').doc(effectiveCallerId).collection('transactions').doc(spendTxnId),
-          spendTxnData
-        );
-        batch.set(
-          scalability.firestore.collection('transactions').doc(spendTxnId),
           spendTxnData
         );
         batch.update(scalability.firestore.collection('users').doc(effectiveCallerId), {
@@ -3692,17 +3662,6 @@ async function deductCoinsAtomically(callerId, amount, callId) {
       transaction.update(userRef, {
         coins: newBalance,
         lastDeductedAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-
-      const txnRef = db.collection('transactions').doc();
-      transaction.set(txnRef, {
-        userId: callerId,
-        callId: callId,
-        amount: -amount,
-        type: 'call_charge',
-        previousBalance: currentBalance,
-        newBalance: newBalance,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
 
       logger.info(`✅ Atomic deduction: ${callerId} - ${amount} coins (${currentBalance} -> ${newBalance})`);
