@@ -464,16 +464,29 @@ router.post('/complete', async (req, res) => {
     // Notify participants that call ended
     const io = req.app.get('io');
     if (io) {
+      // Calculate female earning for the event payload
+      const earningRate = serverTimer.callType === 'video' ? FEMALE_EARNING_RATES.video : FEMALE_EARNING_RATES.audio;
+      const femaleEarningAmount = parseFloat((serverDuration * earningRate).toFixed(2));
+
       [serverTimer.callerId, serverTimer.recipientId].forEach(uid => {
         const conn = getConnectedUser(uid);
         if (conn && conn.isOnline) {
-          io.to(conn.socketId).emit('call_ended', {
+          const eventData = {
             callId: finalCallId,
             durationSeconds: serverDuration,
             coinsDeducted: actualDeduction,
             endReason: endReason || 'User ended call',
+            callType: serverTimer.callType,
             timestamp: new Date().toISOString()
-          });
+          };
+
+          // Add earning data only for the female (recipient)
+          if (uid === effectiveRecipientId) {
+            eventData.earningAmount = femaleEarningAmount;
+            eventData.isRecipient = true;
+          }
+
+          io.to(conn.socketId).emit('call_ended', eventData);
         }
       });
     }
