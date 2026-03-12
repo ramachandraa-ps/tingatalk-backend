@@ -405,25 +405,27 @@ function completeCallSync(callId, updates) {
 
 logger.info('✅ Redis + Firestore sync wrappers initialized');
 
-// 🆕 PRODUCTION FEATURE: Coin rates (server-side source of truth)
+// 🆕 PRODUCTION FEATURE: Coin rates (1 coin = ₹1)
+// Video: 30 coins/min = 0.5 coins/sec | Audio: 10 coins/min ≈ 0.1667 coins/sec
 const COIN_RATES = {
-  audio: 0.2,   // 0.2 coins per second
-  video: 1.0    // 1.0 coin per second
+  audio: 10 / 60,  // 10 coins per minute
+  video: 30 / 60   // 30 coins per minute (0.5 coins/sec)
 };
 
 // 🆕 PRODUCTION FEATURE: Minimum balance requirements (2 minutes)
 const MIN_CALL_DURATION_SECONDS = 120;
-const MIN_BALANCE_AUDIO = COIN_RATES.audio * MIN_CALL_DURATION_SECONDS;  // 24 coins
-const MIN_BALANCE_VIDEO = COIN_RATES.video * MIN_CALL_DURATION_SECONDS;  // 120 coins
+const MIN_BALANCE_AUDIO = Math.ceil(COIN_RATES.audio * MIN_CALL_DURATION_SECONDS);  // 20 coins
+const MIN_BALANCE_VIDEO = Math.ceil(COIN_RATES.video * MIN_CALL_DURATION_SECONDS);  // 60 coins
 
 // ============================================================================
-// COIN PACKAGES — Server-authoritative pricing
+// COIN PACKAGES — Server-authoritative pricing (1 coin = ₹1)
 // ============================================================================
 const COIN_PACKAGES = {
-  'starter_pack': { id: 'starter_pack', name: 'Starter Pack', coinAmount: 100, priceInRupees: 99, discountPercent: 10, isPopular: false, isActive: true },
-  'popular_pack': { id: 'popular_pack', name: 'Popular Pack', coinAmount: 500, priceInRupees: 399, discountPercent: 20, isPopular: true, isActive: true },
-  'value_pack': { id: 'value_pack', name: 'Value Pack', coinAmount: 1000, priceInRupees: 699, discountPercent: 30, isPopular: false, isActive: true },
-  'premium_pack': { id: 'premium_pack', name: 'Premium Pack', coinAmount: 2500, priceInRupees: 1499, discountPercent: 25, isPopular: false, isActive: true },
+  'starter_pack': { id: 'starter_pack', name: 'Starter Pack', coinAmount: 100, priceInRupees: 100, discountPercent: 0, isPopular: false, isActive: true },
+  'small_pack': { id: 'small_pack', name: 'Small Pack', coinAmount: 300, priceInRupees: 300, discountPercent: 0, isPopular: false, isActive: true },
+  'medium_pack': { id: 'medium_pack', name: 'Medium Pack', coinAmount: 600, priceInRupees: 600, discountPercent: 0, isPopular: true, isActive: true },
+  'large_pack': { id: 'large_pack', name: 'Large Pack', coinAmount: 1200, priceInRupees: 1200, discountPercent: 0, isPopular: false, isActive: true },
+  'premium_pack': { id: 'premium_pack', name: 'Premium Pack', coinAmount: 3000, priceInRupees: 3000, discountPercent: 0, isPopular: false, isActive: true },
 };
 
 // Twilio credentials
@@ -2215,7 +2217,7 @@ app.post('/api/calls/complete', async (req, res) => {
     const effectiveRecipientId = finalRecipientId || serverTimer.recipientId;
     if (effectiveRecipientId && serverDuration > 0) {
       try {
-        const earningRate = serverTimer.callType === 'video' ? 0.8 : 0.15;
+        const earningRate = serverTimer.callType === 'video' ? (12.30 / 60) : (4.10 / 60);
         const earningAmount = parseFloat((serverDuration * earningRate).toFixed(2));
         const dateKey = new Date().toISOString().split('T')[0];
 

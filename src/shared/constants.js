@@ -2,32 +2,36 @@
 // TingaTalk Server Constants — Single source of truth
 // ============================================================================
 
-// Coin rates (server-side source of truth)
+// Coin rates (server-side source of truth) — 1 coin = ₹1
+// Video: 30 coins/min = 0.5 coins/sec | Audio: 10 coins/min ≈ 0.1667 coins/sec
 export const COIN_RATES = {
-  audio: 0.2,   // coins per second
-  video: 1.0    // coins per second
+  audio: 10 / 60,  // 10 coins per minute
+  video: 30 / 60   // 30 coins per minute (0.5 coins/sec)
 };
 
-// Minimum call requirements
+// Minimum call requirements (2 minute minimum)
 export const MIN_CALL_DURATION_SECONDS = 120;
 export const MIN_BALANCE = {
-  audio: COIN_RATES.audio * MIN_CALL_DURATION_SECONDS,  // 24 coins
-  video: COIN_RATES.video * MIN_CALL_DURATION_SECONDS   // 120 coins
+  audio: Math.ceil(COIN_RATES.audio * MIN_CALL_DURATION_SECONDS),  // 20 coins
+  video: Math.ceil(COIN_RATES.video * MIN_CALL_DURATION_SECONDS)   // 60 coins
 };
 
 // Female earning rates (INR per second)
+// Revenue split: 50% owner / 50% host, then 18% GST on host share
+// Video: ₹30/min × 50% = ₹15/min → minus 18% GST = ₹12.30/min = ₹0.205/sec
+// Audio: ₹10/min × 50% = ₹5/min  → minus 18% GST = ₹4.10/min  ≈ ₹0.06833/sec
 export const FEMALE_EARNING_RATES = {
-  audio: 0.15,
-  video: 0.80
+  audio: 4.10 / 60,   // ₹4.10 per minute after 50% split + 18% GST
+  video: 12.30 / 60   // ₹12.30 per minute after 50% split + 18% GST
 };
 
-// Coin packages — server-authoritative pricing
+// Coin packages — server-authoritative pricing (1 coin = ₹1)
 export const COIN_PACKAGES = {
-  'basic_pack':    { id: 'basic_pack',    name: 'Basic Pack',    coinAmount: 100,  priceInRupees: 82,   discountPercent: 18, isPopular: false, isActive: true },
-  'starter_pack':  { id: 'starter_pack',  name: 'Starter Pack',  coinAmount: 100,  priceInRupees: 99,   discountPercent: 10, isPopular: false, isActive: true },
-  'popular_pack':  { id: 'popular_pack',  name: 'Popular Pack',  coinAmount: 500,  priceInRupees: 399,  discountPercent: 20, isPopular: true,  isActive: true },
-  'value_pack':    { id: 'value_pack',    name: 'Value Pack',    coinAmount: 1000, priceInRupees: 699,  discountPercent: 30, isPopular: false, isActive: true },
-  'premium_pack':  { id: 'premium_pack',  name: 'Premium Pack',  coinAmount: 2500, priceInRupees: 1499, discountPercent: 25, isPopular: false, isActive: true }
+  'starter_pack':  { id: 'starter_pack',  name: 'Starter Pack',  coinAmount: 100,  priceInRupees: 100,  discountPercent: 0,  isPopular: false, isActive: true },
+  'small_pack':    { id: 'small_pack',    name: 'Small Pack',    coinAmount: 300,  priceInRupees: 300,  discountPercent: 0,  isPopular: false, isActive: true },
+  'medium_pack':   { id: 'medium_pack',   name: 'Medium Pack',   coinAmount: 600,  priceInRupees: 600,  discountPercent: 0,  isPopular: true,  isActive: true },
+  'large_pack':    { id: 'large_pack',    name: 'Large Pack',    coinAmount: 1200, priceInRupees: 1200, discountPercent: 0,  isPopular: false, isActive: true },
+  'premium_pack':  { id: 'premium_pack',  name: 'Premium Pack',  coinAmount: 3000, priceInRupees: 3000, discountPercent: 0,  isPopular: false, isActive: true }
 };
 
 // Daily rewards
