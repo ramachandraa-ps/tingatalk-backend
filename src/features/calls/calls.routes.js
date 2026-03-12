@@ -118,7 +118,8 @@ router.post('/start', async (req, res) => {
     if (!userDoc.exists) return res.status(404).json({ error: 'Caller not found' });
 
     const userData = userDoc.data();
-    const callerBalance = userData.coins ?? userData.coinBalance ?? 0;
+    const callerName = userData.name || userData.displayName || 'Unknown';
+    const callerBalance = userData.coins ?? 0;
     const requiredBalance = callType === 'video' ? MIN_BALANCE.video : MIN_BALANCE.audio;
 
     if (callerBalance < requiredBalance) {
@@ -154,7 +155,7 @@ router.post('/start', async (req, res) => {
 
     setCallTimer(callId, {
       interval, durationSeconds: 0, coinRate, callerId, recipientId,
-      callType, startTime, lastHeartbeat: Date.now()
+      callType, callerName, startTime, lastHeartbeat: Date.now()
     });
 
     res.json({
@@ -352,7 +353,7 @@ router.post('/complete', async (req, res) => {
       const userRef = db.collection('users').doc(effectiveCallerId);
       const userDoc = await userRef.get();
       const data = userDoc.data() || {};
-      const currentBalance = data.coins ?? data.coinBalance ?? 0;
+      const currentBalance = data.coins ?? 0;
 
       // Guard: don't deduct more than available
       actualDeduction = Math.min(coinsDeducted, Math.max(0, currentBalance));
@@ -372,7 +373,7 @@ router.post('/complete', async (req, res) => {
     const newBalance = await (async () => {
       const doc = await db.collection('users').doc(effectiveCallerId || serverTimer.callerId).get();
       const d = doc.data() || {};
-      return d.coins ?? d.coinBalance ?? 0;
+      return d.coins ?? 0;
     })();
 
     // Update call in Firestore
@@ -393,8 +394,8 @@ router.post('/complete', async (req, res) => {
 
         const femaleEarningsRef = db.collection('female_earnings').doc(effectiveRecipientId);
         await femaleEarningsRef.set({
-          totalEarningsINR: admin.firestore.FieldValue.increment(earningAmount),
-          availableBalanceINR: admin.firestore.FieldValue.increment(earningAmount),
+          totalEarnings: admin.firestore.FieldValue.increment(earningAmount),
+          availableBalance: admin.firestore.FieldValue.increment(earningAmount),
           totalCalls: admin.firestore.FieldValue.increment(1),
           totalDurationSeconds: admin.firestore.FieldValue.increment(serverDuration),
           [`total${serverTimer.callType === 'video' ? 'Video' : 'Audio'}Calls`]: admin.firestore.FieldValue.increment(1),
@@ -410,6 +411,24 @@ router.post('/complete', async (req, res) => {
           durationSeconds: admin.firestore.FieldValue.increment(serverDuration),
           lastUpdated: admin.firestore.FieldValue.serverTimestamp()
         }, { merge: true });
+
+        // Record individual transaction for female earnings history
+        const femaleTransactionRef = femaleEarningsRef.collection('transactions').doc(finalCallId);
+        await femaleTransactionRef.set({
+          type: 'call_earning',
+          callId: finalCallId,
+          callerId: serverTimer.callerId,
+          callerName: serverTimer.callerName || 'Unknown',
+          callType: serverTimer.callType,
+          isVideoCall: serverTimer.callType === 'video',
+          durationSeconds: serverDuration,
+          amount: earningAmount,
+          currency: 'INR',
+          ratePerSecond: earningRate,
+          completedAt: new Date().toISOString(),
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          status: 'completed'
+        });
       } catch (err) {
         logger.error(`Failed to record female earnings: ${err.message}`);
       }
@@ -433,7 +452,6 @@ router.post('/complete', async (req, res) => {
 
         const batch = db.batch();
         batch.set(db.collection('users').doc(effectiveCallerId).collection('transactions').doc(spendTxnId), spendTxnData);
-        batch.set(db.collection('transactions').doc(spendTxnId), spendTxnData);
         batch.update(db.collection('users').doc(effectiveCallerId), {
           totalCoinsSpent: admin.firestore.FieldValue.increment(actualDeduction)
         });
@@ -464,16 +482,29 @@ router.post('/complete', async (req, res) => {
     // Notify participants that call ended
     const io = req.app.get('io');
     if (io) {
+      // Calculate female earning for the event payload
+      const earningRate = serverTimer.callType === 'video' ? FEMALE_EARNING_RATES.video : FEMALE_EARNING_RATES.audio;
+      const femaleEarningAmount = parseFloat((serverDuration * earningRate).toFixed(2));
+
       [serverTimer.callerId, serverTimer.recipientId].forEach(uid => {
         const conn = getConnectedUser(uid);
         if (conn && conn.isOnline) {
-          io.to(conn.socketId).emit('call_ended', {
+          const eventData = {
             callId: finalCallId,
             durationSeconds: serverDuration,
             coinsDeducted: actualDeduction,
             endReason: endReason || 'User ended call',
+            callType: serverTimer.callType,
             timestamp: new Date().toISOString()
-          });
+          };
+
+          // Add earning data only for the female (recipient)
+          if (uid === effectiveRecipientId) {
+            eventData.earningAmount = femaleEarningAmount;
+            eventData.isRecipient = true;
+          }
+
+          io.to(conn.socketId).emit('call_ended', eventData);
         }
       });
     }

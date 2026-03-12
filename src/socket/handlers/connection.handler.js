@@ -176,7 +176,7 @@ export function registerConnectionHandlers(io, socket) {
                   const userRef = db.collection('users').doc(call.callerId);
                   const userDoc = await userRef.get();
                   const data = userDoc.data() || {};
-                  const currentBalance = data.coins ?? data.coinBalance ?? 0;
+                  const currentBalance = data.coins ?? 0;
                   const actualDeduction = Math.min(coinsDeducted, Math.max(0, currentBalance));
                   if (actualDeduction > 0) {
                     await userRef.update({
