@@ -1,9 +1,9 @@
-name: Deploy to Staging
+name: Deploy Staging
 
 on:
   push:
     branches: [feature/modular-backend]
-  workflow_dispatch:  # Allow manual trigger
+  workflow_dispatch:
 
 jobs:
   deploy-staging:
@@ -19,38 +19,56 @@ jobs:
           host: ${{ secrets.VPS_HOST }}
           username: root
           password: ${{ secrets.VPS_PASSWORD }}
-          timeout: 60s
+          timeout: 120s
           script: |
             echo "=========================================="
-            echo "Starting TingaTalk STAGING Deployment..."
+            echo "  STAGING DEPLOY — tingatalk-staging"
             echo "=========================================="
 
             cd /var/www/tingatalk-new
 
-            echo "Pulling latest changes..."
+            echo ">> Pulling latest feature/modular-backend..."
             git fetch origin feature/modular-backend
             git reset --hard origin/feature/modular-backend
 
-            echo "Installing dependencies..."
+            echo ">> Installing dependencies..."
             npm install --production
 
-            echo "Restarting PM2 process..."
-            pm2 restart tingatalk-new
+            # Start or restart staging (handles both stopped and running states)
+            echo ">> Starting/restarting staging..."
+            STAGING_STATUS=$(pm2 jlist 2>/dev/null | python3 -c "
+            import sys, json
+            procs = json.load(sys.stdin)
+            for p in procs:
+                if p['name'] == 'tingatalk-staging':
+                    print(p['pm2_env']['status'])
+                    break
+            else:
+                print('not_found')
+            " 2>/dev/null || echo "unknown")
 
-            echo "Saving PM2 process list..."
+            if [ "$STAGING_STATUS" = "stopped" ]; then
+              echo ">> Staging was stopped, starting it..."
+              pm2 start tingatalk-staging
+            elif [ "$STAGING_STATUS" = "not_found" ]; then
+              echo ">> Staging process not found, creating it..."
+              cd /var/www/tingatalk-new
+              PORT=3002 pm2 start src/server.js --name tingatalk-staging
+            else
+              echo ">> Staging is $STAGING_STATUS, restarting..."
+              pm2 restart tingatalk-staging
+            fi
+
             pm2 save
 
-            echo "Waiting for startup..."
             sleep 3
 
-            echo "Health check..."
+            echo ">> Health check..."
             curl -sf http://localhost:3002/api/health | python3 -m json.tool || echo "Health check failed!"
 
             echo "=========================================="
-            echo "Staging deployment completed!"
-            echo "URL: https://staging-api.tingatalk.in"
-            echo "Swagger: https://staging-api.tingatalk.in/api-docs"
+            echo "  Staging deployed!"
+            echo "  https://staging-api.tingatalk.in"
+            echo "  Swagger: https://staging-api.tingatalk.in/api-docs"
             echo "=========================================="
-
-            echo "Current PM2 status:"
             pm2 status

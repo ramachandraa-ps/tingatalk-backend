@@ -1,9 +1,9 @@
-name: Deploy to VPS
+name: Deploy Production
 
 on:
   push:
     branches: [main]
-  workflow_dispatch:  # Allow manual trigger
+  workflow_dispatch:
 
 jobs:
   deploy:
@@ -13,38 +13,51 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Deploy to VPS
+      - name: Deploy to Production & Stop Staging
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.VPS_HOST }}
           username: root
           password: ${{ secrets.VPS_PASSWORD }}
+          timeout: 120s
           script: |
             echo "=========================================="
-            echo "Starting TingaTalk Backend Deployment..."
+            echo "  PRODUCTION DEPLOY — tingatalk-backend"
             echo "=========================================="
 
             cd /var/www/tingatalk-backend
 
-            echo "Pulling latest changes..."
+            echo ">> Pulling latest main..."
             git fetch origin main
             git reset --hard origin/main
 
-            echo "Installing dependencies..."
+            echo ">> Installing dependencies..."
             npm install --production
 
-            echo "Running build check..."
-            npm run build
+            echo ">> Restarting production..."
+            pm2 restart tingatalk-backend || pm2 start ecosystem.config.cjs --env production
 
-            echo "Restarting PM2 process..."
-            pm2 restart tingatalk-backend || pm2 start ecosystem.config.js --env production
+            sleep 3
 
-            echo "Saving PM2 process list..."
+            echo ">> Health check..."
+            curl -sf http://localhost:3000/api/health | python3 -m json.tool || echo "Health check failed!"
+
+            # Stop staging if branches are now in sync (main was updated = branch was merged)
+            echo ">> Checking if staging should be stopped..."
+            PROD_COMMIT=$(cd /var/www/tingatalk-backend && git rev-parse HEAD)
+            STAGE_COMMIT=$(cd /var/www/tingatalk-new && git fetch origin feature/modular-backend 2>/dev/null && git rev-parse origin/feature/modular-backend 2>/dev/null || echo "none")
+
+            if [ "$PROD_COMMIT" = "$STAGE_COMMIT" ]; then
+              echo ">> Branches in sync — stopping staging to save resources..."
+              pm2 stop tingatalk-staging 2>/dev/null || true
+            else
+              echo ">> Staging branch has diverged — keeping staging alive."
+            fi
+
             pm2 save
 
             echo "=========================================="
-            echo "Deployment completed successfully!"
+            echo "  Production deployed!"
+            echo "  https://api.tingatalk.in"
             echo "=========================================="
-
-            echo "Current PM2 status:"
             pm2 status
