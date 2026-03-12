@@ -64,8 +64,9 @@ const router = Router();
  */
 router.post('/orders', async (req, res) => {
   try {
-    const { currency = 'INR', userName, packageId, coins, receipt, notes } = req.body;
-    const userId = req.authenticatedUserId;
+    const { currency = 'INR', userName, packageId, coins, receipt, notes, userId: bodyUserId } = req.body;
+    // Use session ID from body (user_xxx_xxx) — NOT req.authenticatedUserId (Firebase Auth UID)
+    const userId = bodyUserId || req.authenticatedUserId;
     if (!userId || !packageId) return res.status(400).json({ error: 'userId and packageId are required' });
 
     const coinPackage = COIN_PACKAGES[packageId];
@@ -151,8 +152,9 @@ router.post('/orders', async (req, res) => {
  */
 router.post('/verify', async (req, res) => {
   try {
-    const { orderId, paymentId, signature } = req.body;
-    const userId = req.authenticatedUserId;
+    const { orderId, paymentId, signature, userId: bodyUserId } = req.body;
+    // Use session ID from body (user_xxx_xxx) — NOT req.authenticatedUserId (Firebase Auth UID)
+    const userId = bodyUserId || req.authenticatedUserId;
 
     if (!orderId || !paymentId || !signature) {
       return res.status(400).json({ error: 'orderId, paymentId and signature are required' });
