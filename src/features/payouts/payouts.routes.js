@@ -99,11 +99,11 @@ router.post('/payouts', async (req, res) => {
 
     const docRef = await db.collection('payout_requests').add(payoutRequest);
 
-    // Update female_earnings: decrement availableBalance, increment claimedAmount
+    // Update female_earnings: decrement availableBalance, increment pendingAmount
     const earningsRef = db.collection('female_earnings').doc(userId);
     await earningsRef.set({
       availableBalance: admin.firestore.FieldValue.increment(-amount),
-      claimedAmount: admin.firestore.FieldValue.increment(amount)
+      pendingAmount: admin.firestore.FieldValue.increment(amount)
     }, { merge: true });
 
     logger.info(`Payout request ${docRef.id} created for user ${userId}, amount: ${amount} ${currency}`);
@@ -300,15 +300,24 @@ router.put('/payouts/:requestId', async (req, res) => {
 
     await docRef.update(updateData);
 
-    // If rejected, restore the balance back to female_earnings
-    if (status === 'rejected') {
-      const earningsRef = db.collection('female_earnings').doc(existingData.userId);
+    const earningsRef = db.collection('female_earnings').doc(existingData.userId);
+
+    if (status === 'completed') {
+      // Move from pending to claimed
       await earningsRef.set({
-        availableBalance: admin.firestore.FieldValue.increment(existingData.amount),
-        claimedAmount: admin.firestore.FieldValue.increment(-existingData.amount)
+        pendingAmount: admin.firestore.FieldValue.increment(-existingData.amount),
+        claimedAmount: admin.firestore.FieldValue.increment(existingData.amount)
       }, { merge: true });
 
-      logger.info(`Payout request ${requestId} rejected — restored ${existingData.amount} ${existingData.currency} to user ${existingData.userId}`);
+      logger.info(`Payout request ${requestId} completed — moved ${existingData.amount} ${existingData.currency} from pending to claimed for user ${existingData.userId}`);
+    } else if (status === 'rejected') {
+      // Restore from pending back to available
+      await earningsRef.set({
+        pendingAmount: admin.firestore.FieldValue.increment(-existingData.amount),
+        availableBalance: admin.firestore.FieldValue.increment(existingData.amount)
+      }, { merge: true });
+
+      logger.info(`Payout request ${requestId} rejected — restored ${existingData.amount} ${existingData.currency} to available for user ${existingData.userId}`);
     } else {
       logger.info(`Payout request ${requestId} updated to status: ${status}`);
     }
