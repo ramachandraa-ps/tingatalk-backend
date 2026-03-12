@@ -8,6 +8,7 @@ import helmet from 'helmet';
 import { config } from './config/index.js';
 import { apiLimiter } from './middleware/rateLimiter.js';
 import { authenticate } from './middleware/auth.js';
+import { adminAuth } from './middleware/adminAuth.js';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js';
 import { setupSwagger } from './swagger.js';
 
@@ -24,6 +25,8 @@ import rewardsRoutes from './features/rewards/rewards.routes.js';
 import payoutsRoutes from './features/payouts/payouts.routes.js';
 import statsRoutes from './features/stats/stats.routes.js';
 import diagnosticsRoutes from './features/diagnostics/diagnostics.routes.js';
+import ticketRoutes from './features/tickets/tickets.routes.js';
+import adminTicketRoutes from './features/tickets/admin.tickets.routes.js';
 
 export function createApp() {
   const app = express();
@@ -68,12 +71,14 @@ export function createApp() {
 
   // --- Admin routes (before catch-all /api auth routes) ---
   app.use('/api/diagnostic', diagnosticsRoutes);
+  app.use('/api/admin/tickets', adminAuth, adminTicketRoutes);
 
   // --- Authenticated routes ---
   app.use('/api/user', authenticate, usersRoutes);
   app.use('/api/calls', authenticate, callsRoutes);
   app.use('/api/payments', authenticate, paymentsRoutes);
   app.use('/api/rewards', authenticate, rewardsRoutes);
+  app.use('/api/tickets', authenticate, ticketRoutes);
   app.use('/api', authenticate, payoutsRoutes);
   app.use('/api', authenticate, statsRoutes);
 
