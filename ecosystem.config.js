@@ -1,7 +1,7 @@
 module.exports = {
   apps: [{
     name: 'tingatalk-backend',
-    script: 'server.js',
+    script: 'src/server.js',
     instances: 1,  // 🔥 FIX: Single instance for WebSocket compatibility
     exec_mode: 'fork',  // 🔥 FIX: Fork mode (not cluster) for Socket.IO
     env: {
