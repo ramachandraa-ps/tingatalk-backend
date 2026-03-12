@@ -119,7 +119,7 @@ router.post('/start', async (req, res) => {
 
     const userData = userDoc.data();
     const callerName = userData.name || userData.displayName || 'Unknown';
-    const callerBalance = userData.coins ?? userData.coinBalance ?? 0;
+    const callerBalance = userData.coins ?? 0;
     const requiredBalance = callType === 'video' ? MIN_BALANCE.video : MIN_BALANCE.audio;
 
     if (callerBalance < requiredBalance) {
@@ -353,7 +353,7 @@ router.post('/complete', async (req, res) => {
       const userRef = db.collection('users').doc(effectiveCallerId);
       const userDoc = await userRef.get();
       const data = userDoc.data() || {};
-      const currentBalance = data.coins ?? data.coinBalance ?? 0;
+      const currentBalance = data.coins ?? 0;
 
       // Guard: don't deduct more than available
       actualDeduction = Math.min(coinsDeducted, Math.max(0, currentBalance));
@@ -373,7 +373,7 @@ router.post('/complete', async (req, res) => {
     const newBalance = await (async () => {
       const doc = await db.collection('users').doc(effectiveCallerId || serverTimer.callerId).get();
       const d = doc.data() || {};
-      return d.coins ?? d.coinBalance ?? 0;
+      return d.coins ?? 0;
     })();
 
     // Update call in Firestore
@@ -452,7 +452,6 @@ router.post('/complete', async (req, res) => {
 
         const batch = db.batch();
         batch.set(db.collection('users').doc(effectiveCallerId).collection('transactions').doc(spendTxnId), spendTxnData);
-        batch.set(db.collection('transactions').doc(spendTxnId), spendTxnData);
         batch.update(db.collection('users').doc(effectiveCallerId), {
           totalCoinsSpent: admin.firestore.FieldValue.increment(actualDeduction)
         });

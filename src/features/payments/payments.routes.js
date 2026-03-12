@@ -217,12 +217,6 @@ router.post('/verify', async (req, res) => {
 
       t.set(db.collection('users').doc(userId).collection('transactions').doc(transactionId), transactionData);
 
-      t.set(db.collection('transactions').doc(transactionId), {
-        ...transactionData,
-        userDisplayName: userDoc.exists ? (userDoc.data().name || 'Unknown') : 'Unknown',
-        userGender: userDoc.exists ? (userDoc.data().gender || 'unknown') : 'unknown'
-      });
-
       t.set(db.collection('payment_verifications').doc(orderId), {
         orderId, paymentId, userId, verificationId,
         packageId: coinPackage.id, coinsCredited: coinPackage.coinAmount,
@@ -239,16 +233,6 @@ router.post('/verify', async (req, res) => {
         lastUpdated: admin.firestore.FieldValue.serverTimestamp()
       }, { merge: true });
     } catch (err) { logger.warn('Admin analytics update failed:', err.message); }
-
-    // Male user tracking (non-critical)
-    try {
-      await db.collection('male_users_admin').doc(userId).set({
-        totalCoinsPurchased: admin.firestore.FieldValue.increment(coinPackage.coinAmount),
-        totalPurchaseCount: admin.firestore.FieldValue.increment(1),
-        totalSpentINR: admin.firestore.FieldValue.increment(coinPackage.priceInRupees),
-        lastPurchaseAt: admin.firestore.FieldValue.serverTimestamp()
-      }, { merge: true });
-    } catch (err) { logger.warn('Male user tracking failed:', err.message); }
 
     logger.info(`Payment verified: ${coinPackage.coinAmount} coins to user ${userId}`);
 

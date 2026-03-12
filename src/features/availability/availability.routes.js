@@ -392,14 +392,14 @@ router.get('/get_available_females', async (req, res) => {
         } else {
           powerUpStats = {
             rating: userData.rating || 0,
-            totalCalls: userData.totalCallsReceived || 0,
+            totalCalls: userData.totalCalls || 0,
             totalLikes: userData.totalLikes || 0
           };
         }
       } catch (e) {
         powerUpStats = {
           rating: userData.rating || 0,
-          totalCalls: userData.totalCallsReceived || 0,
+          totalCalls: userData.totalCalls || 0,
           totalLikes: userData.totalLikes || 0
         };
       }
@@ -412,7 +412,7 @@ router.get('/get_available_females', async (req, res) => {
 
       availableFemales.push({
         userId,
-        name: userData.name || 'Unknown',
+        name: userData.displayName || userData.name || 'Unknown',
         age: userData.age || 0,
         photoUrl: userData.photoUrl || '',
         fullPhotoUrl: userData.fullPhotoUrl || userData.photoUrl || '',

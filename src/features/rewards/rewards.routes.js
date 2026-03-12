@@ -130,9 +130,6 @@ router.post('/daily-claim', async (req, res) => {
         }
 
         t.set(db.collection('users').doc(userId).collection('transactions').doc(transactionId), txnData);
-        t.set(db.collection('transactions').doc(transactionId), {
-          ...txnData, userDisplayName: userData.name || 'Unknown', userGender: userData.gender || 'unknown'
-        });
         t.update(userRef, updateData);
       });
     } catch (txnError) {
@@ -147,7 +144,7 @@ router.post('/daily-claim', async (req, res) => {
 
     // Get updated balance
     const updatedDoc = await db.collection('users').doc(userId).get();
-    const newBalance = updatedDoc.data()?.coins ?? updatedDoc.data()?.coinBalance ?? 0;
+    const newBalance = updatedDoc.data()?.coins ?? 0;
 
     res.json({
       success: true, coinsCredited: DAILY_REWARD_COINS, transactionId,
