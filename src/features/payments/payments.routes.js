@@ -229,11 +229,25 @@ router.post('/verify', async (req, res) => {
 
     // Admin analytics (non-critical)
     try {
-      await db.collection('admin_analytics').doc('financial_stats').set({
+      const financialRef = db.collection('admin_analytics').doc('financial_stats');
+      await financialRef.set({
         totalRevenue: admin.firestore.FieldValue.increment(coinPackage.priceInRupees),
         todayRevenue: admin.firestore.FieldValue.increment(coinPackage.priceInRupees),
         lastUpdated: admin.firestore.FieldValue.serverTimestamp()
       }, { merge: true });
+
+      // Recalculate netProfit and trueProfit from current values
+      const financialDoc = await financialRef.get();
+      if (financialDoc.exists) {
+        const data = financialDoc.data();
+        const totalRevenue = data.totalRevenue || 0;
+        const totalPayouts = data.totalPayouts || 0;
+        const pendingPayouts = data.pendingPayouts || 0;
+        await financialRef.update({
+          netProfit: totalRevenue - totalPayouts,
+          trueProfit: totalRevenue - totalPayouts - pendingPayouts
+        });
+      }
     } catch (err) { logger.warn('Admin analytics update failed:', err.message); }
 
     logger.info(`Payment verified: ${coinPackage.coinAmount} coins to user ${userId}`);
