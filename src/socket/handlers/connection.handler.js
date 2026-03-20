@@ -6,11 +6,21 @@ import {
   getActiveCall,
   getCallTimer, deleteCallTimer,
   startDisconnectTimeout, cancelDisconnectTimeout,
-  completeCall, setCallTimer
+  completeCall, setCallTimer,
+  forceSetUnavailable
 } from '../state/connectionManager.js';
 import { COIN_RATES } from '../../shared/constants.js';
 
 export function registerConnectionHandlers(io, socket) {
+
+  // Handle force-close signal from Flutter _handleDetached()
+  socket.on('set_unavailable', async (data) => {
+    const userId = data?.userId || data?.user_id;
+    if (!userId) return;
+
+    logger.info(`Force-close signal received for ${userId} (reason: ${data?.reason || 'unknown'})`);
+    await forceSetUnavailable(userId, io);
+  });
 
   socket.on('join', async (data) => {
     let userId, userType;

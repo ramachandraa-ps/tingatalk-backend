@@ -100,7 +100,20 @@ router.post('/check_availability', async (req, res) => {
       }
     }
 
-    if (!hasConnection) actualStatus = 'unavailable';
+    // No socket? Check Firestore — user may be FCM-reachable (backgrounded with toggle ON)
+    if (!hasConnection) {
+      try {
+        const db = getFirestore();
+        if (db) {
+          const userDoc = await db.collection('users').doc(recipient_id).get();
+          if (userDoc.exists && userDoc.data().isAvailable === true) {
+            actualStatus = 'available';
+          }
+        }
+      } catch (err) {
+        logger.warn(`Firestore fallback check failed for ${recipient_id}: ${err.message}`);
+      }
+    }
 
     const isAvailable = actualStatus === 'available';
 
@@ -361,11 +374,11 @@ router.get('/get_available_females', async (req, res) => {
       const userData = doc.data();
       const userId = doc.id;
 
-      // Check WebSocket connection - REQUIRED for browse
+      if (userData.isAvailable !== true) continue;
+
+      // Check reachability: socket OR FCM token
       const userConnection = getConnectedUser(userId);
       const hasActiveConnection = userConnection && userConnection.isOnline;
-
-      if (!hasActiveConnection) continue; // Skip offline females entirely
 
       let isSocketConnected = false;
       if (hasActiveConnection) {
@@ -373,9 +386,10 @@ router.get('/get_available_females', async (req, res) => {
         isSocketConnected = userSocket && userSocket.connected;
       }
 
-      if (!isSocketConnected) continue; // Skip if socket not actually connected
+      const hasFcmToken = !!userData.fcmToken && userData.fcmToken.length > 0;
 
-      if (userData.isAvailable !== true) continue;
+      // Must have either socket or FCM token to be reachable
+      if (!isSocketConnected && !hasFcmToken) continue;
 
       // Determine status (available or busy)
       const userStatusData = getUserStatus(userId);
@@ -416,8 +430,9 @@ router.get('/get_available_females', async (req, res) => {
         age: userData.age || 0,
         photoUrl: userData.photoUrl || '',
         fullPhotoUrl: userData.fullPhotoUrl || userData.photoUrl || '',
-        isOnline: true, // Always true since we filtered above
+        isOnline: isSocketConnected,
         isAvailable: true,
+        connectionType: isSocketConnected ? 'socket' : 'fcm',
         status, // 'available' or 'busy'
         currentCallId,
         rating: powerUpStats.rating,

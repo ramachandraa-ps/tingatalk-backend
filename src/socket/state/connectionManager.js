@@ -1,7 +1,7 @@
 import { logger } from '../../utils/logger.js';
 import { getRedis } from '../../config/redis.js';
 import { getFirestore, admin } from '../../config/firebase.js';
-import { DISCONNECT_TIMEOUT_MS } from '../../shared/constants.js';
+import { DISCONNECT_TIMEOUT_MS, AVAILABILITY_TIMEOUT_MS } from '../../shared/constants.js';
 
 // In-memory state (synced to Redis non-blocking)
 const connectedUsers = new Map();
@@ -9,6 +9,7 @@ const userStatus = new Map();
 const activeCalls = new Map();
 const callTimers = new Map();
 const disconnectTimeouts = new Map();
+const availabilityTimeouts = new Map();
 
 // --- Connected Users ---
 export function setConnectedUser(userId, userData) {
@@ -180,22 +181,25 @@ export function startDisconnectTimeout(userId, userType, io) {
       const db = getFirestore();
       if (db) {
         if (userType === 'female') {
+          // Tier 1: ONLY set isOnline=false. NEVER touch isAvailable here.
+          // Female stays FCM-reachable for calls while backgrounded.
+          // isAvailable is ONLY changed by: manual toggle, logout, force-close signal, or Tier 2 safety net.
           await db.collection('users').doc(userId).update({
-            isAvailable: false,
             isOnline: false,
             lastSeenAt: new Date(),
-            disconnectedAt: new Date(),
-            forceClosedAt: new Date()
+            disconnectedAt: new Date()
           });
-          logger.info(`Female user ${userId} - BOTH isAvailable AND isOnline set to FALSE (force-close detected)`);
+          logger.info(`Female user ${userId} - Tier 1: isOnline=false (isAvailable preserved, FCM-reachable)`);
 
           io.emit('availability_changed', {
             femaleUserId: userId,
-            isAvailable: false,
             isOnline: false,
-            reason: 'force_close_detected',
+            reason: 'disconnect_timeout',
             timestamp: new Date().toISOString()
           });
+
+          // Start Tier 2: 30-min safety net for force-close detection
+          _startAvailabilityTimeout(userId, io);
         } else {
           await db.collection('users').doc(userId).update({
             isOnline: false,
@@ -231,6 +235,85 @@ export function cancelDisconnectTimeout(userId) {
     clearTimeout(existing.timeoutId);
     disconnectTimeouts.delete(userId);
     logger.info(`Cancelled disconnect timeout for ${userId} (reconnected)`);
+  }
+  _cancelAvailabilityTimeout(userId);
+}
+
+// --- Tier 2: 30-min Availability Safety Net ---
+function _startAvailabilityTimeout(userId, io) {
+  _cancelAvailabilityTimeout(userId);
+
+  const minutes = AVAILABILITY_TIMEOUT_MS / 60000;
+  logger.info(`Starting ${minutes}-min availability safety net for ${userId}`);
+
+  const timeoutId = setTimeout(async () => {
+    const userConnection = connectedUsers.get(userId);
+    if (userConnection && userConnection.isOnline) {
+      logger.info(`User ${userId} reconnected — cancelling availability timeout`);
+      availabilityTimeouts.delete(userId);
+      return;
+    }
+
+    try {
+      const db = getFirestore();
+      if (db) {
+        await db.collection('users').doc(userId).update({
+          isAvailable: false,
+          isOnline: false,
+          availabilityTimedOutAt: new Date()
+        });
+        logger.info(`Female user ${userId} - Tier 2: isAvailable=false (${minutes}-min safety net fired)`);
+
+        io.emit('availability_changed', {
+          femaleUserId: userId,
+          isAvailable: false,
+          isOnline: false,
+          reason: 'availability_timeout',
+          timestamp: new Date().toISOString()
+        });
+      }
+    } catch (error) {
+      logger.error(`Error in availability timeout for ${userId}: ${error.message}`);
+    }
+
+    availabilityTimeouts.delete(userId);
+  }, AVAILABILITY_TIMEOUT_MS);
+
+  availabilityTimeouts.set(userId, { timeoutId, startedAt: new Date() });
+}
+
+function _cancelAvailabilityTimeout(userId) {
+  const existing = availabilityTimeouts.get(userId);
+  if (existing) {
+    clearTimeout(existing.timeoutId);
+    availabilityTimeouts.delete(userId);
+    logger.info(`Cancelled availability timeout for ${userId} (reconnected)`);
+  }
+}
+
+// Force-close: immediately set isAvailable=false (called from set_unavailable handler)
+export async function forceSetUnavailable(userId, io) {
+  _cancelAvailabilityTimeout(userId);
+  try {
+    const db = getFirestore();
+    if (db) {
+      await db.collection('users').doc(userId).update({
+        isAvailable: false,
+        isOnline: false,
+        appTerminatedAt: new Date()
+      });
+      logger.info(`User ${userId} - Force-close: isAvailable=false, isOnline=false`);
+
+      io.emit('availability_changed', {
+        femaleUserId: userId,
+        isAvailable: false,
+        isOnline: false,
+        reason: 'app_terminated',
+        timestamp: new Date().toISOString()
+      });
+    }
+  } catch (error) {
+    logger.error(`Error in forceSetUnavailable for ${userId}: ${error.message}`);
   }
 }
 

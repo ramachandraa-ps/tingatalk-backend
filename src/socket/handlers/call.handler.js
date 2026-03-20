@@ -30,12 +30,10 @@ async function sendIncomingCallNotification(userId, callData) {
       return false;
     }
 
+    // Data-only FCM: no `notification` field so Flutter's onBackgroundMessage
+    // handler gets full control to show the full-screen incoming call UI.
     const message = {
       token: fcmToken,
-      notification: {
-        title: 'Incoming Call',
-        body: `${callData.callerName || 'Someone'} is calling you...`
-      },
       data: {
         type: 'incoming_call',
         callId: callData.callId || '',
@@ -54,23 +52,15 @@ async function sendIncomingCallNotification(userId, callData) {
       },
       android: {
         priority: 'high',
-        ttl: 60000,
-        notification: {
-          channelId: 'incoming_calls',
-          priority: 'max',
-          defaultSound: true,
-          defaultVibrateTimings: true,
-          visibility: 'public',
-          clickAction: 'FLUTTER_NOTIFICATION_CLICK'
-        }
+        ttl: 60000
       },
       apns: {
-        headers: { 'apns-priority': '10', 'apns-push-type': 'alert' },
+        headers: { 'apns-priority': '10', 'apns-push-type': 'background' },
         payload: {
           aps: {
-            alert: { title: 'Incoming Call', body: `${callData.callerName || 'Someone'} is calling you...` },
-            sound: 'default', badge: 1, 'content-available': 1,
-            'mutable-content': 1, 'interruption-level': 'time-sensitive'
+            'content-available': 1,
+            'mutable-content': 1,
+            sound: 'default'
           }
         }
       }
@@ -500,6 +490,7 @@ export function registerCallHandlers(io, socket) {
 
     // Reset all participants
     if (call.participants) {
+      const db = getFirestore();
       call.participants.forEach(participantId => {
         setUserStatus(participantId, {
           status: 'available', currentCallId: null, lastStatusChange: new Date()
@@ -513,6 +504,15 @@ export function registerCallHandlers(io, socket) {
             duration: call.endedAt - call.createdAt,
             endedAt: call.endedAt.toISOString()
           });
+        }
+
+        // Persist isAvailable=true to Firestore so check_availability reads correct
+        // value during the socket reconnection gap after call screen navigation
+        if (db) {
+          db.collection('users').doc(participantId).update({
+            isAvailable: true,
+            lastCallEndedAt: admin.firestore.FieldValue.serverTimestamp()
+          }).catch(err => logger.warn(`Failed to persist post-call status for ${participantId}: ${err.message}`));
         }
       });
     }

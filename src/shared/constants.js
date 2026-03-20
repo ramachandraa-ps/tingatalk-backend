@@ -38,7 +38,8 @@ export const COIN_PACKAGES = {
 export const DAILY_REWARD_COINS = 10;
 
 // Timeouts (milliseconds)
-export const DISCONNECT_TIMEOUT_MS = 15000;        // 15 seconds before marking user offline
+export const DISCONNECT_TIMEOUT_MS = 15000;        // 15 seconds before marking user offline (Tier 1: isOnline=false)
+export const AVAILABILITY_TIMEOUT_MS = 1800000;    // 30 minutes safety net (Tier 2: isAvailable=false for force-close)
 export const HEARTBEAT_TIMEOUT_MS = 60000;          // 60 seconds before stale call detection
 export const HEARTBEAT_CHECK_INTERVAL_MS = 15000;   // Check every 15 seconds
 export const CALL_RING_TIMEOUT_MS = 30000;           // 30 seconds ring timeout (WebSocket)

@@ -69,7 +69,8 @@ router.post('/check_call_status', async (req, res) => {
 
     if (activeCall) {
       const callStatus = activeCall.status || 'unknown';
-      const isRinging = callStatus === 'ringing' || callStatus === 'initiated';
+      const isRinging = callStatus === 'ringing' || callStatus === 'initiated'
+                     || callStatus === 'pending_fcm' || callStatus === 'ringing_fcm';
       const isConnected = callStatus === 'connected' || callStatus === 'answered';
       const isEnded = ENDED_CALL_STATUSES.includes(callStatus);
       const isActive = !isEnded && (isRinging || isConnected || callStatus === 'unknown');
