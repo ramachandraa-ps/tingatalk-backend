@@ -113,7 +113,18 @@ export function registerConnectionHandlers(io, socket) {
       logger.warn(`Could not update online status in Firestore: ${err.message}`);
     }
 
+    // Broadcast availability to all connected users (so male browse + favorites update)
     const userStatusObj = getUserStatus(userId);
+    if (userType === 'female' || (userStatusObj && userStatusObj.userPreference === true)) {
+      io.emit('availability_changed', {
+        femaleUserId: userId,
+        isAvailable: userStatusObj ? userStatusObj.status === 'available' : true,
+        isOnline: true,
+        reason: 'user_connected',
+        timestamp: new Date().toISOString()
+      });
+    }
+
     socket.emit('joined', {
       userId,
       userType: userType || 'unknown',
