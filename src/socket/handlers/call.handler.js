@@ -473,7 +473,23 @@ export function registerCallHandlers(io, socket) {
 
     const call = getActiveCall(callId);
     if (!call) {
-      socket.emit('error', { message: 'Call not found' });
+      // Call already cleaned up (by other party's end_call, timeout, or stale detector)
+      // Still persist isAvailable=true for the user who sent this event
+      logger.info(`end_call for already-cleaned call ${callId} from ${userId} — persisting availability`);
+      if (userId) {
+        setUserStatus(userId, { status: 'available', currentCallId: null, lastStatusChange: new Date() });
+        try {
+          const db = getFirestore();
+          if (db) {
+            await db.collection('users').doc(userId).update({
+              isAvailable: true,
+              lastCallEndedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+          }
+        } catch (err) {
+          logger.warn(`Failed to persist availability for ${userId}: ${err.message}`);
+        }
+      }
       return;
     }
 
