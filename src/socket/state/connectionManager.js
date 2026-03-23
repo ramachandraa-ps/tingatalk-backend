@@ -193,6 +193,7 @@ export function startDisconnectTimeout(userId, userType, io) {
 
           io.emit('availability_changed', {
             femaleUserId: userId,
+            isAvailable: true,
             isOnline: false,
             reason: 'disconnect_timeout',
             timestamp: new Date().toISOString()
