@@ -386,10 +386,9 @@ router.get('/get_available_females', async (req, res) => {
         isSocketConnected = userSocket && userSocket.connected;
       }
 
-      const hasFcmToken = !!userData.fcmToken && userData.fcmToken.length > 0;
-
-      // Must have either socket or FCM token to be reachable
-      if (!isSocketConnected && !hasFcmToken) continue;
+      // Must have active socket connection to appear in browse
+      // FCM token alone is not enough — female must be actively connected
+      if (!isSocketConnected) continue;
 
       // Determine status (available or busy)
       const userStatusData = getUserStatus(userId);
