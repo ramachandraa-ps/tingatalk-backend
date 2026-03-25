@@ -100,21 +100,7 @@ router.post('/check_availability', async (req, res) => {
       }
     }
 
-    // No socket? Check Firestore — user may be FCM-reachable (backgrounded with toggle ON)
-    if (!hasConnection) {
-      try {
-        const db = getFirestore();
-        if (db) {
-          const userDoc = await db.collection('users').doc(recipient_id).get();
-          if (userDoc.exists && userDoc.data().isAvailable === true) {
-            actualStatus = 'available';
-          }
-        }
-      } catch (err) {
-        logger.warn(`Firestore fallback check failed for ${recipient_id}: ${err.message}`);
-      }
-    }
-
+    // No socket connection = not available (no FCM fallback)
     const isAvailable = actualStatus === 'available';
 
     res.json({
