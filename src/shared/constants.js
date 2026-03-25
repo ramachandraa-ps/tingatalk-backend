@@ -39,7 +39,7 @@ export const DAILY_REWARD_COINS = 10;
 
 // Timeouts (milliseconds)
 export const DISCONNECT_TIMEOUT_MS = 15000;        // 15 seconds before marking user offline (Tier 1: isOnline=false)
-export const AVAILABILITY_TIMEOUT_MS = 600000;     // 10 minutes safety net (Tier 2: isAvailable=false for backgrounded app)
+export const AVAILABILITY_TIMEOUT_MS = 1800000;    // 30 minutes safety net (Tier 2: isAvailable=false for backgrounded app)
 export const FCM_PING_TIMEOUT_MS = 45000;           // 45 seconds to wait for FCM ping response (Tier 1.5: force-close detection)
 export const HEARTBEAT_TIMEOUT_MS = 60000;          // 60 seconds before stale call detection
 export const HEARTBEAT_CHECK_INTERVAL_MS = 15000;   // Check every 15 seconds
