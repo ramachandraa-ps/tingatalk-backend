@@ -10,6 +10,7 @@ import { createApp } from './app.js';
 import { createSocketServer } from './socket/index.js';
 import { startBackgroundJobs, stopBackgroundJobs } from './backgroundJobs.js';
 import { getAllCallTimers } from './socket/state/connectionManager.js';
+import { getFirestore } from './config/firebase.js';
 import { logger } from './utils/logger.js';
 import { COIN_RATES, MIN_BALANCE } from './shared/constants.js';
 
@@ -38,6 +39,22 @@ async function main() {
     const { recoverCallTimersFromRedis } = await import('./backgroundJobs.js');
     await recoverCallTimersFromRedis();
   }, 5000);
+
+  // 6b. Startup cleanup: reset stale isOnline users from previous server instance
+  try {
+    const db = getFirestore();
+    if (db) {
+      const staleUsers = await db.collection('users').where('isOnline', '==', true).get();
+      if (!staleUsers.empty) {
+        const batch = db.batch();
+        staleUsers.docs.forEach(doc => batch.update(doc.ref, { isOnline: false }));
+        await batch.commit();
+        logger.info(`Startup cleanup: reset ${staleUsers.docs.length} stale isOnline=true users`);
+      }
+    }
+  } catch (err) {
+    logger.warn(`Startup cleanup failed: ${err.message}`);
+  }
 
   // 7. Start listening
   server.listen(config.port, config.host, () => {

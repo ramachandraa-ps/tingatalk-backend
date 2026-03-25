@@ -217,14 +217,41 @@ export async function recoverCallTimersFromRedis() {
 // ============================================================================
 // Start / Stop
 // ============================================================================
+// --- Stale Connection Cleanup (every 5 minutes) ---
+let staleCleanupIntervalId = null;
+
+function startStaleConnectionCleanup(io) {
+  staleCleanupIntervalId = setInterval(() => {
+    const allUsers = getAllConnectedUsers();
+    let cleaned = 0;
+
+    for (const [userId, userData] of allUsers.entries()) {
+      if (!userData.isOnline) continue;
+
+      const socket = io.sockets.sockets.get(userData.socketId);
+      if (!socket || !socket.connected) {
+        logger.info(`Cleaning stale connection for ${userId} (socket ${userData.socketId} is dead)`);
+        userData.isOnline = false;
+        cleaned++;
+      }
+    }
+
+    if (cleaned > 0) {
+      logger.info(`Stale connection cleanup: removed ${cleaned} dead connections`);
+    }
+  }, 300000); // Every 5 minutes
+}
+
 export function startBackgroundJobs(io) {
   startHeartbeatMonitor(io);
   startMemoryProtection();
+  startStaleConnectionCleanup(io);
   logger.info(`Background jobs started (heartbeat timeout: ${HEARTBEAT_TIMEOUT_MS / 1000}s, check interval: ${HEARTBEAT_CHECK_INTERVAL_MS / 1000}s)`);
 }
 
 export function stopBackgroundJobs() {
   if (heartbeatIntervalId) clearInterval(heartbeatIntervalId);
   if (memoryCheckIntervalId) clearInterval(memoryCheckIntervalId);
+  if (staleCleanupIntervalId) clearInterval(staleCleanupIntervalId);
   logger.info('Background jobs stopped');
 }

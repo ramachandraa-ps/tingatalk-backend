@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { getFirestore } from '../../config/firebase.js';
 import { logger } from '../../utils/logger.js';
 import {
-  getUserStatus, setUserStatus, getConnectedUser
+  getUserStatus, setUserStatus, getConnectedUser, confirmBackgrounded
 } from '../../socket/state/connectionManager.js';
 import { StatsSyncUtil } from '../../utils/statsSyncUtil.js';
 
@@ -243,7 +243,7 @@ router.post('/update_availability', async (req, res) => {
       const db = getFirestore();
       const userDoc = await db.collection('users').doc(user_id).get();
       if (userDoc.exists && userDoc.data().gender === 'female') {
-        io.sockets.emit('availability_changed', {
+        io.to('room_male_browse').emit('availability_changed', {
           femaleUserId: user_id,
           isAvailable: is_available,
           status: newStatus,
@@ -458,6 +458,36 @@ router.get('/get_available_females', async (req, res) => {
       details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
     });
   }
+});
+
+/**
+ * @openapi
+ * /api/availability_heartbeat:
+ *   post:
+ *     tags: [Availability]
+ *     summary: Respond to availability ping (confirms app is backgrounded, not force-closed)
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [user_id]
+ *             properties:
+ *               user_id:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Heartbeat acknowledged
+ */
+router.post('/availability_heartbeat', (req, res) => {
+  const userId = req.body.user_id || req.body.userId;
+  if (!userId) {
+    return res.status(400).json({ error: 'user_id is required' });
+  }
+
+  confirmBackgrounded(userId);
+  res.json({ success: true, message: 'Heartbeat acknowledged' });
 });
 
 export default router;

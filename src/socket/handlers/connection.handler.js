@@ -7,7 +7,8 @@ import {
   getCallTimer, deleteCallTimer,
   startDisconnectTimeout, cancelDisconnectTimeout,
   completeCall, setCallTimer,
-  forceSetUnavailable
+  forceSetUnavailable,
+  confirmBackgrounded
 } from '../state/connectionManager.js';
 import { COIN_RATES } from '../../shared/constants.js';
 
@@ -20,6 +21,14 @@ export function registerConnectionHandlers(io, socket) {
 
     logger.info(`Force-close signal received for ${userId} (reason: ${data?.reason || 'unknown'})`);
     await forceSetUnavailable(userId, io);
+  });
+
+  // Handle availability heartbeat response from backgrounded female app
+  socket.on('availability_heartbeat', (data) => {
+    const userId = data?.userId || data?.user_id;
+    if (!userId) return;
+    logger.info(`Availability heartbeat received from ${userId} (app is backgrounded, not force-closed)`);
+    confirmBackgrounded(userId);
   });
 
   socket.on('join', async (data) => {
@@ -98,6 +107,11 @@ export function registerConnectionHandlers(io, socket) {
     const roomName = `user_${userId}`;
     socket.join(roomName);
 
+    // Males join browse room for scoped availability broadcasts
+    if (userType === 'male') {
+      socket.join('room_male_browse');
+    }
+
     // Update Firestore online status
     try {
       const db = getFirestore();
@@ -113,10 +127,10 @@ export function registerConnectionHandlers(io, socket) {
       logger.warn(`Could not update online status in Firestore: ${err.message}`);
     }
 
-    // Broadcast availability to all connected users (so male browse + favorites update)
+    // Broadcast availability to males browsing (so male browse + favorites update)
     const userStatusObj = getUserStatus(userId);
     if (userType === 'female' || (userStatusObj && userStatusObj.userPreference === true)) {
-      io.emit('availability_changed', {
+      io.to('room_male_browse').emit('availability_changed', {
         femaleUserId: userId,
         isAvailable: userStatusObj ? userStatusObj.status === 'available' : true,
         isOnline: true,
