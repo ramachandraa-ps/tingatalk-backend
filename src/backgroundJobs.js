@@ -7,7 +7,7 @@ import { getRedis } from './config/redis.js';
 import { getFirestore, admin } from './config/firebase.js';
 import {
   getAllCallTimers, deleteCallTimer, setUserStatus, deleteActiveCall,
-  getConnectedUser, getAllActiveCalls
+  getConnectedUser, getAllActiveCalls, getAllConnectedUsers
 } from './socket/state/connectionManager.js';
 import {
   HEARTBEAT_TIMEOUT_MS, HEARTBEAT_CHECK_INTERVAL_MS,
