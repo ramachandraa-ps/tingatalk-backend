@@ -244,78 +244,118 @@ export function cancelDisconnectTimeout(userId) {
   _cancelAvailabilityTimeout(userId);
 }
 
-// --- Tier 1.5: FCM Ping to detect force-close vs background ---
+// --- Tier 1.5: Double FCM Ping to detect force-close vs background ---
+// Why double ping: Android keeps the background isolate alive briefly after force-close,
+// so a single ping always gets a response. A second ping 30s later catches the dead process.
 async function _startFcmPingCheck(userId, io) {
   _cancelFcmPingCheck(userId);
   confirmedBackgrounded.delete(userId);
 
-  logger.info(`Tier 1.5: Sending FCM availability_ping to ${userId} (${FCM_PING_TIMEOUT_MS / 1000}s timeout)`);
-
-  // Send FCM silent push to check if app is alive in background
-  try {
-    const messaging = getMessaging();
-    const db = getFirestore();
-    if (messaging && db) {
-      const userDoc = await db.collection('users').doc(userId).get();
-      const fcmToken = userDoc.exists ? userDoc.data()?.fcmToken : null;
-
-      if (fcmToken) {
-        await messaging.send({
-          token: fcmToken,
-          data: {
-            type: 'availability_ping',
-            userId: userId,
-            timestamp: new Date().toISOString()
-          },
-          android: { priority: 'high', ttl: 60000 },
-          apns: {
-            headers: { 'apns-priority': '10', 'apns-push-type': 'background' },
-            payload: { aps: { 'content-available': 1 } }
-          }
-        });
-        logger.info(`FCM availability_ping sent to ${userId}`);
-      } else {
-        logger.warn(`No FCM token for ${userId} — treating as force-close`);
-        // No FCM token = can't verify, force unavailable immediately
-        await _forceUnavailableOnPingTimeout(userId, io);
-        return;
-      }
-    }
-  } catch (err) {
-    logger.error(`FCM ping send error for ${userId}: ${err.message}`);
-    // FCM send failed — might be invalid token, treat as force-close
-    if (err.code === 'messaging/invalid-registration-token' ||
-        err.code === 'messaging/registration-token-not-registered') {
-      await _forceUnavailableOnPingTimeout(userId, io);
-      return;
-    }
+  const fcmToken = await _getUserFcmToken(userId);
+  if (!fcmToken) {
+    logger.warn(`No FCM token for ${userId} — treating as force-close`);
+    await _forceUnavailableOnPingTimeout(userId, io);
+    return;
   }
 
-  // Start timeout — if no heartbeat response within FCM_PING_TIMEOUT_MS, assume force-close
+  // Send first ping
+  logger.info(`Tier 1.5: Sending FIRST FCM ping to ${userId}`);
+  const sent = await _sendFcmPing(userId, fcmToken, 'ping_1');
+  if (!sent) {
+    await _forceUnavailableOnPingTimeout(userId, io);
+    return;
+  }
+
+  // After 30 seconds, send second verification ping
   const timeoutId = setTimeout(async () => {
     const userConnection = connectedUsers.get(userId);
     if (userConnection && userConnection.isOnline) {
-      logger.info(`User ${userId} reconnected before FCM ping timeout`);
+      logger.info(`User ${userId} reconnected — skipping second ping`);
       fcmPingTimeouts.delete(userId);
       return;
     }
 
-    if (confirmedBackgrounded.has(userId)) {
-      // User responded to ping — app is backgrounded, start Tier 2
-      logger.info(`User ${userId} confirmed backgrounded — starting Tier 2 (${AVAILABILITY_TIMEOUT_MS / 60000} min)`);
+    // Reset confirmation flag before second ping
+    confirmedBackgrounded.delete(userId);
+    logger.info(`Tier 1.5: Sending SECOND verification FCM ping to ${userId}`);
+    const sent2 = await _sendFcmPing(userId, fcmToken, 'ping_2');
+
+    if (!sent2) {
+      logger.info(`Tier 1.5: Second ping failed to send — force-close detected`);
+      await _forceUnavailableOnPingTimeout(userId, io);
       fcmPingTimeouts.delete(userId);
-      confirmedBackgrounded.delete(userId);
-      _startAvailabilityTimeout(userId, io);
       return;
     }
 
-    // No response — force-close detected
-    logger.info(`Tier 1.5: No FCM ping response from ${userId} — force-close detected`);
-    await _forceUnavailableOnPingTimeout(userId, io);
-    fcmPingTimeouts.delete(userId);
-  }, FCM_PING_TIMEOUT_MS);
+    // Wait 30s more for second response
+    const secondTimeoutId = setTimeout(async () => {
+      const conn = connectedUsers.get(userId);
+      if (conn && conn.isOnline) {
+        logger.info(`User ${userId} reconnected before second ping timeout`);
+        fcmPingTimeouts.delete(userId);
+        return;
+      }
 
-  fcmPingTimeouts.set(userId, { timeoutId, sentAt: new Date() });
+      if (confirmedBackgrounded.has(userId)) {
+        // Responded to BOTH pings — truly backgrounded
+        logger.info(`User ${userId} responded to BOTH pings — confirmed backgrounded, starting Tier 2 (${AVAILABILITY_TIMEOUT_MS / 60000} min)`);
+        confirmedBackgrounded.delete(userId);
+        _startAvailabilityTimeout(userId, io);
+      } else {
+        // Responded to first but NOT second — force-close (dying process responded to first)
+        logger.info(`Tier 1.5: No response to second ping from ${userId} — FORCE-CLOSE detected`);
+        await _forceUnavailableOnPingTimeout(userId, io);
+      }
+      fcmPingTimeouts.delete(userId);
+    }, 30000);
+
+    fcmPingTimeouts.set(userId, { timeoutId: secondTimeoutId, sentAt: new Date(), phase: 'ping_2' });
+  }, 30000);
+
+  fcmPingTimeouts.set(userId, { timeoutId, sentAt: new Date(), phase: 'ping_1' });
+}
+
+async function _getUserFcmToken(userId) {
+  try {
+    const db = getFirestore();
+    if (!db) return null;
+    const userDoc = await db.collection('users').doc(userId).get();
+    return userDoc.exists ? userDoc.data()?.fcmToken : null;
+  } catch (err) {
+    logger.error(`Failed to get FCM token for ${userId}: ${err.message}`);
+    return null;
+  }
+}
+
+async function _sendFcmPing(userId, fcmToken, pingPhase) {
+  try {
+    const messaging = getMessaging();
+    if (!messaging) return false;
+
+    await messaging.send({
+      token: fcmToken,
+      data: {
+        type: 'availability_ping',
+        userId: userId,
+        pingPhase: pingPhase,
+        timestamp: new Date().toISOString()
+      },
+      android: { priority: 'high', ttl: 30000 },
+      apns: {
+        headers: { 'apns-priority': '10', 'apns-push-type': 'background' },
+        payload: { aps: { 'content-available': 1 } }
+      }
+    });
+    logger.info(`FCM ${pingPhase} sent to ${userId}`);
+    return true;
+  } catch (err) {
+    logger.error(`FCM ${pingPhase} send error for ${userId}: ${err.message}`);
+    if (err.code === 'messaging/invalid-registration-token' ||
+        err.code === 'messaging/registration-token-not-registered') {
+      return false;
+    }
+    return true; // Other errors (network) — don't treat as force-close
+  }
 }
 
 function _cancelFcmPingCheck(userId) {
