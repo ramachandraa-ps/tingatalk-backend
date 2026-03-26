@@ -76,6 +76,7 @@ export function registerConnectionHandlers(io, socket) {
     });
 
     // Set user status from Firestore preference
+    // Read availabilityPreference (user's toggle choice) — NOT isAvailable (system-managed)
     const currentStatus = getUserStatus(userId);
     if (!currentStatus || currentStatus.status === 'unavailable' || currentStatus.status === 'disconnected') {
       let savedPreference = true;
@@ -84,8 +85,12 @@ export function registerConnectionHandlers(io, socket) {
         if (db) {
           const userDoc = await db.collection('users').doc(userId).get();
           if (userDoc.exists) {
-            savedPreference = userDoc.data().isAvailable !== false;
-            logger.info(`Loaded saved availability preference for ${userId}: ${savedPreference}`);
+            const userData = userDoc.data();
+            // Use availabilityPreference (user's toggle) — fallback to isAvailable for old users
+            savedPreference = userData.availabilityPreference !== undefined
+              ? userData.availabilityPreference !== false
+              : userData.isAvailable !== false;
+            logger.info(`Loaded availability preference for ${userId}: ${savedPreference} (from ${userData.availabilityPreference !== undefined ? 'availabilityPreference' : 'isAvailable'})`);
           }
         }
       } catch (err) {
@@ -112,15 +117,23 @@ export function registerConnectionHandlers(io, socket) {
       socket.join('room_male_browse');
     }
 
-    // Update Firestore online status
+    // Update Firestore online status + restore isAvailable from preference
+    const userPref = getUserStatus(userId);
+    const restoreAvailable = userPref && userPref.userPreference === true;
     try {
       const db = getFirestore();
       if (db) {
-        await db.collection('users').doc(userId).update({
+        const updateData = {
           isOnline: true,
           lastSeenAt: new Date(),
           lastConnectedAt: new Date()
-        });
+        };
+        // Restore isAvailable to match user's toggle preference
+        if (restoreAvailable) {
+          updateData.isAvailable = true;
+          logger.info(`User ${userId} - restoring isAvailable=true from preference`);
+        }
+        await db.collection('users').doc(userId).update(updateData);
         logger.info(`User ${userId} marked as online in Firestore`);
       }
     } catch (err) {

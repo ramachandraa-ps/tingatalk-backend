@@ -103,10 +103,26 @@ router.post('/check_availability', async (req, res) => {
     // No socket connection = not available (no FCM fallback)
     const isAvailable = actualStatus === 'available';
 
+    // Also return the user's toggle preference (survives force-close)
+    let togglePreference = null;
+    try {
+      const db = getFirestore();
+      if (db) {
+        const userDoc = await db.collection('users').doc(recipient_id).get();
+        if (userDoc.exists) {
+          const data = userDoc.data();
+          togglePreference = data.availabilityPreference !== undefined
+            ? data.availabilityPreference
+            : data.isAvailable;
+        }
+      }
+    } catch (_) {}
+
     res.json({
       success: true,
       is_available: isAvailable,
       user_status: actualStatus,
+      availability_preference: togglePreference,
       current_call_id: currentCallId,
       message: isAvailable ? 'User is available' : `User is currently ${actualStatus}`
     });
@@ -200,11 +216,12 @@ router.post('/update_availability', async (req, res) => {
       userPreference: is_available
     });
 
-    // Persist to Firestore
+    // Persist to Firestore — save both current state AND user preference
     try {
       const db = getFirestore();
       await db.collection('users').doc(user_id).set({
         isAvailable: is_available,
+        availabilityPreference: is_available, // User's explicit toggle choice — never overwritten by system
         lastAvailabilityUpdate: new Date(),
         updatedAt: new Date()
       }, { merge: true });
