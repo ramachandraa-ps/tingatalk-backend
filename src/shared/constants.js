@@ -25,13 +25,15 @@ export const FEMALE_EARNING_RATES = {
   video: 12.30 / 60   // ₹12.30 per minute after 50% split + 18% GST
 };
 
-// Coin packages — server-authoritative pricing (1 coin = ₹1)
+// Coin packages — server-authoritative pricing
+// Limited Time Offer: 60% OFF (original = ₹2.50/coin, offer = ₹1/coin)
 export const COIN_PACKAGES = {
-  'starter_pack':  { id: 'starter_pack',  name: 'Starter Pack',  coinAmount: 100,  priceInRupees: 100,  discountPercent: 0,  isPopular: false, isActive: true },
-  'small_pack':    { id: 'small_pack',    name: 'Small Pack',    coinAmount: 300,  priceInRupees: 300,  discountPercent: 0,  isPopular: false, isActive: true },
-  'medium_pack':   { id: 'medium_pack',   name: 'Medium Pack',   coinAmount: 600,  priceInRupees: 600,  discountPercent: 0,  isPopular: true,  isActive: true },
-  'large_pack':    { id: 'large_pack',    name: 'Large Pack',    coinAmount: 1200, priceInRupees: 1200, discountPercent: 0,  isPopular: false, isActive: true },
-  'premium_pack':  { id: 'premium_pack',  name: 'Premium Pack',  coinAmount: 3000, priceInRupees: 3000, discountPercent: 0,  isPopular: false, isActive: true }
+  'mini_pack':     { id: 'mini_pack',     name: 'Mini Pack',     coinAmount: 50,   priceInRupees: 50,   originalPrice: 125,  discountPercent: 60, isPopular: false, isActive: true },
+  'starter_pack':  { id: 'starter_pack',  name: 'Starter Pack',  coinAmount: 100,  priceInRupees: 100,  originalPrice: 250,  discountPercent: 60, isPopular: false, isActive: true },
+  'popular_pack':  { id: 'popular_pack',  name: 'Popular Pack',  coinAmount: 300,  priceInRupees: 300,  originalPrice: 750,  discountPercent: 60, isPopular: true,  isActive: true },
+  'value_pack':    { id: 'value_pack',    name: 'Value Pack',    coinAmount: 500,  priceInRupees: 500,  originalPrice: 1250, discountPercent: 60, isPopular: false, isActive: true },
+  'mega_pack':     { id: 'mega_pack',     name: 'Mega Pack',     coinAmount: 1000, priceInRupees: 1000, originalPrice: 2500, discountPercent: 60, isPopular: false, isActive: true },
+  'ultimate_pack': { id: 'ultimate_pack', name: 'Ultimate Pack', coinAmount: 1500, priceInRupees: 1500, originalPrice: 3750, discountPercent: 60, isPopular: false, isActive: true }
 };
 
 // Daily rewards
