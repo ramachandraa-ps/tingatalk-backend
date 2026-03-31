@@ -52,6 +52,10 @@ const router = Router();
  *         description: Server error
  */
 router.post('/daily-claim', async (req, res) => {
+  // 🔒 Daily rewards feature is currently disabled by client request.
+  // To re-enable: remove the early return below.
+  return res.status(403).json({ success: false, message: 'Daily rewards are currently disabled' });
+
   try {
     const userId = req.authenticatedUserId;
     if (!userId) return res.status(401).json({ error: 'Authentication required' });
