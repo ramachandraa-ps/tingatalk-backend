@@ -84,7 +84,10 @@ router.post('/check-user', async (req, res) => {
         name: data.name || data.displayName || null,
         gender: data.gender || null,
         isVerified: data.isVerified || false,
-        profileImageUrl: data.profileImageUrl || null
+        profileImageUrl: data.profileImageUrl || null,
+        verificationPhoto: data.verificationPhoto || null,
+        verificationStatus: data.verificationStatus || null,
+        onboardingCompleted: data.onboardingCompleted || false
       };
     })() : null;
 
