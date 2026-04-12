@@ -11,6 +11,7 @@ import {
   confirmBackgrounded
 } from '../state/connectionManager.js';
 import { COIN_RATES, FEMALE_EARNING_RATES } from '../../shared/constants.js';
+import { updateCallLogs } from '../../utils/callLogUtil.js';
 
 export function registerConnectionHandlers(io, socket) {
 
@@ -289,6 +290,19 @@ export function registerConnectionHandlers(io, socket) {
                       logger.error(`Failed to record female earnings on disconnect: ${earningsErr.message}`);
                     }
                   }
+
+                  // Update call logs for both users
+                  await updateCallLogs({
+                    callId,
+                    callerId: call.callerId,
+                    recipientId,
+                    callType: serverTimer.callType || call.callType || 'audio',
+                    durationSeconds,
+                    coinsDeducted: actualDeduction,
+                    status: 'completed',
+                    endReason: 'connection_lost',
+                    source: 'disconnect_recovery',
+                  });
                 }
               } catch (deductErr) {
                 logger.error(`Failed to deduct coins on disconnect: ${deductErr.message}`);

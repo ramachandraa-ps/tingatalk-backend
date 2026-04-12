@@ -14,6 +14,7 @@ import {
   MAX_CONCURRENT_CALLS, REDIS_CALL_TIMER_EXPIRY, COIN_RATES,
   FEMALE_EARNING_RATES
 } from './shared/constants.js';
+import { updateCallLogs } from './utils/callLogUtil.js';
 
 let heartbeatIntervalId = null;
 let memoryCheckIntervalId = null;
@@ -119,6 +120,19 @@ function startHeartbeatMonitor(io) {
                 logger.error(`Failed to record female earnings for stale call ${callId}: ${earningsError.message}`);
               }
             }
+
+            // Update call logs for both users
+            await updateCallLogs({
+              callId,
+              callerId: timer.callerId,
+              recipientId: timer.recipientId,
+              callType: timer.callType || 'audio',
+              durationSeconds: finalDuration,
+              coinsDeducted,
+              status: 'completed',
+              endReason: 'connection_lost',
+              source: 'stale_call_recovery',
+            });
           }
         } catch (error) {
           logger.error(`Error closing stale call ${callId}: ${error.message}`);
