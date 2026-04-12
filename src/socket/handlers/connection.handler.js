@@ -10,7 +10,7 @@ import {
   forceSetUnavailable,
   confirmBackgrounded
 } from '../state/connectionManager.js';
-import { COIN_RATES } from '../../shared/constants.js';
+import { COIN_RATES, FEMALE_EARNING_RATES } from '../../shared/constants.js';
 
 export function registerConnectionHandlers(io, socket) {
 
@@ -61,9 +61,11 @@ export function registerConnectionHandlers(io, socket) {
       logger.warn(`User ${userId} reconnecting - Previous socket: ${existingUser.socketId}, New: ${socket.id}`);
       const oldSocket = io.sockets.sockets.get(existingUser.socketId);
       if (oldSocket) {
+        // Flag old socket so its disconnect event skips full cleanup
+        oldSocket._replacedByNewConnection = true;
         oldSocket.leave(`user_${userId}`);
         oldSocket.disconnect(true);
-        logger.info(`Disconnected old socket: ${existingUser.socketId}`);
+        logger.info(`Disconnected old socket: ${existingUser.socketId} (flagged as replaced)`);
       }
     }
 
@@ -165,6 +167,12 @@ export function registerConnectionHandlers(io, socket) {
   });
 
   socket.on('disconnect', async (reason) => {
+    // Skip full cleanup if this socket was replaced by a new connection from same user
+    if (socket._replacedByNewConnection) {
+      logger.info(`Skipping disconnect cleanup for replaced socket: ${socket.id} - Reason: ${reason}`);
+      return;
+    }
+
     logger.info(`User disconnected: ${socket.id} - Reason: ${reason}`);
 
     const allUsers = getAllConnectedUsers();
@@ -233,6 +241,54 @@ export function registerConnectionHandlers(io, socket) {
                     });
                   }
                   logger.info(`Deducted ${actualDeduction} coins from ${call.callerId} for disconnected call`);
+
+                  // Record female earnings for disconnect-ended calls
+                  const recipientId = call.recipientId || serverTimer.recipientId;
+                  if (recipientId && durationSeconds > 0) {
+                    try {
+                      const callType = serverTimer.callType || call.callType || 'audio';
+                      const earningRate = callType === 'video' ? FEMALE_EARNING_RATES.video : FEMALE_EARNING_RATES.audio;
+                      const earningAmount = parseFloat((durationSeconds * earningRate).toFixed(2));
+                      const dateKey = new Date().toISOString().split('T')[0];
+                      const femaleEarningsRef = db.collection('female_earnings').doc(recipientId);
+
+                      await femaleEarningsRef.set({
+                        totalEarnings: admin.firestore.FieldValue.increment(earningAmount),
+                        availableBalance: admin.firestore.FieldValue.increment(earningAmount),
+                        totalCalls: admin.firestore.FieldValue.increment(1),
+                        totalDurationSeconds: admin.firestore.FieldValue.increment(durationSeconds),
+                        lastCallAt: admin.firestore.FieldValue.serverTimestamp(),
+                        lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+                      }, { merge: true });
+
+                      await femaleEarningsRef.collection('daily').doc(dateKey).set({
+                        date: dateKey,
+                        earnings: admin.firestore.FieldValue.increment(earningAmount),
+                        calls: admin.firestore.FieldValue.increment(1),
+                        durationSeconds: admin.firestore.FieldValue.increment(durationSeconds),
+                        lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+                      }, { merge: true });
+
+                      await femaleEarningsRef.collection('transactions').doc(callId).set({
+                        type: 'call_earning',
+                        callId,
+                        callerId: call.callerId,
+                        callType,
+                        durationSeconds,
+                        amount: earningAmount,
+                        currency: 'INR',
+                        ratePerSecond: earningRate,
+                        completedAt: new Date().toISOString(),
+                        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                        status: 'completed',
+                        source: 'disconnect_recovery'
+                      });
+
+                      logger.info(`Female earnings recorded for disconnect call ${callId}: ₹${earningAmount} to ${recipientId}`);
+                    } catch (earningsErr) {
+                      logger.error(`Failed to record female earnings on disconnect: ${earningsErr.message}`);
+                    }
+                  }
                 }
               } catch (deductErr) {
                 logger.error(`Failed to deduct coins on disconnect: ${deductErr.message}`);
@@ -279,11 +335,12 @@ export function registerConnectionHandlers(io, socket) {
 
       const userType = user.userType || 'unknown';
 
-      // Female-specific immediate updates
+      // Female-specific updates — defer Firestore write to the 15s disconnect timeout
+      // This prevents flapping (rapid online/offline) during brief reconnections
       if (userType === 'female') {
-        logger.info(`Female user ${userId} disconnected - IMMEDIATE update`);
+        logger.info(`Female user ${userId} disconnected - deferring offline status to 15s timeout`);
 
-        // Emit to connected males for instant UI update
+        // Emit to connected males for instant UI update (in-memory only, no Firestore)
         io.emit('user_disconnected', {
           disconnectedUserId: userId,
           userId,
@@ -291,28 +348,6 @@ export function registerConnectionHandlers(io, socket) {
           timestamp: new Date().toISOString(),
           reason: 'websocket_disconnect'
         });
-
-        // Update Firestore - ONLY set isOnline=false, preserve isAvailable toggle
-        try {
-          const db = getFirestore();
-          if (db) {
-            await db.collection('users').doc(userId).update({
-              isOnline: false,
-              lastSeenAt: new Date(),
-              disconnectedAt: new Date()
-            });
-            logger.info(`Female user ${userId} - isOnline set to FALSE (toggle preserved)`);
-
-            io.emit('user_status_changed', {
-              femaleUserId: userId,
-              isOnline: false,
-              reason: 'disconnect',
-              timestamp: new Date().toISOString()
-            });
-          }
-        } catch (firestoreError) {
-          logger.error(`Failed to update Firestore for female ${userId}:`, firestoreError.message);
-        }
       }
 
       // Start disconnect timeout (backup mechanism)
