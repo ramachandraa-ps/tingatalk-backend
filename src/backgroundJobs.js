@@ -11,8 +11,10 @@ import {
 } from './socket/state/connectionManager.js';
 import {
   HEARTBEAT_TIMEOUT_MS, HEARTBEAT_CHECK_INTERVAL_MS,
-  MAX_CONCURRENT_CALLS, REDIS_CALL_TIMER_EXPIRY, COIN_RATES
+  MAX_CONCURRENT_CALLS, REDIS_CALL_TIMER_EXPIRY, COIN_RATES,
+  FEMALE_EARNING_RATES
 } from './shared/constants.js';
+import { updateCallLogs } from './utils/callLogUtil.js';
 
 let heartbeatIntervalId = null;
 let memoryCheckIntervalId = null;
@@ -71,6 +73,66 @@ function startHeartbeatMonitor(io) {
               endReason: 'No heartbeat received - connection lost'
             });
             logger.info(`Stale call ${callId} billed and closed: ${coinsToDeduct} coins deducted`);
+
+            // Record female earnings for stale calls
+            if (timer.recipientId && finalDuration > 0) {
+              try {
+                const callType = timer.callType || 'audio';
+                const earningRate = callType === 'video' ? FEMALE_EARNING_RATES.video : FEMALE_EARNING_RATES.audio;
+                const earningAmount = parseFloat((finalDuration * earningRate).toFixed(2));
+                const dateKey = new Date().toISOString().split('T')[0];
+                const femaleEarningsRef = db.collection('female_earnings').doc(timer.recipientId);
+
+                await femaleEarningsRef.set({
+                  totalEarnings: admin.firestore.FieldValue.increment(earningAmount),
+                  availableBalance: admin.firestore.FieldValue.increment(earningAmount),
+                  totalCalls: admin.firestore.FieldValue.increment(1),
+                  totalDurationSeconds: admin.firestore.FieldValue.increment(finalDuration),
+                  lastCallAt: admin.firestore.FieldValue.serverTimestamp(),
+                  lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+                }, { merge: true });
+
+                await femaleEarningsRef.collection('daily').doc(dateKey).set({
+                  date: dateKey,
+                  earnings: admin.firestore.FieldValue.increment(earningAmount),
+                  calls: admin.firestore.FieldValue.increment(1),
+                  durationSeconds: admin.firestore.FieldValue.increment(finalDuration),
+                  lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+                }, { merge: true });
+
+                await femaleEarningsRef.collection('transactions').doc(callId).set({
+                  type: 'call_earning',
+                  callId,
+                  callerId: timer.callerId,
+                  callType,
+                  durationSeconds: finalDuration,
+                  amount: earningAmount,
+                  currency: 'INR',
+                  ratePerSecond: earningRate,
+                  completedAt: new Date().toISOString(),
+                  createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                  status: 'completed',
+                  source: 'stale_call_recovery'
+                });
+
+                logger.info(`Female earnings recorded for stale call ${callId}: ₹${earningAmount} to ${timer.recipientId}`);
+              } catch (earningsError) {
+                logger.error(`Failed to record female earnings for stale call ${callId}: ${earningsError.message}`);
+              }
+            }
+
+            // Update call logs for both users
+            await updateCallLogs({
+              callId,
+              callerId: timer.callerId,
+              recipientId: timer.recipientId,
+              callType: timer.callType || 'audio',
+              durationSeconds: finalDuration,
+              coinsDeducted,
+              status: 'completed',
+              endReason: 'connection_lost',
+              source: 'stale_call_recovery',
+            });
           }
         } catch (error) {
           logger.error(`Error closing stale call ${callId}: ${error.message}`);

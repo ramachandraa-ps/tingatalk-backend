@@ -12,6 +12,7 @@ import {
   COIN_RATES, MIN_BALANCE, MIN_CALL_DURATION_SECONDS,
   FEMALE_EARNING_RATES, ENDED_CALL_STATUSES
 } from '../../shared/constants.js';
+import { updateCallLogs } from '../../utils/callLogUtil.js';
 
 const router = Router();
 
@@ -472,6 +473,19 @@ router.post('/complete', async (req, res) => {
     } catch (err) {
       logger.warn('Call analytics update failed:', err.message);
     }
+
+    // Update call logs for both users (so frontend call history shows correctly)
+    await updateCallLogs({
+      callId: finalCallId,
+      callerId: serverTimer.callerId,
+      recipientId: effectiveRecipientId,
+      callType: serverTimer.callType,
+      durationSeconds: serverDuration,
+      coinsDeducted: actualDeduction,
+      status: 'completed',
+      endReason: endReason || 'completed',
+      source: 'normal_completion',
+    });
 
     deleteCallTimer(finalCallId);
 
