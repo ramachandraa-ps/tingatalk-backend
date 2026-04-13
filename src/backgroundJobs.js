@@ -38,11 +38,33 @@ function startHeartbeatMonitor(io) {
       const timeSinceLastHeartbeat = now - timer.lastHeartbeat;
 
       if (timeSinceLastHeartbeat > HEARTBEAT_TIMEOUT_MS) {
+        // Stop the timer interval immediately
+        if (timer.interval) clearInterval(timer.interval);
+
+        // Check if this call was already cancelled/declined/ended in Firestore before billing
+        try {
+          const db = getFirestore();
+          if (db) {
+            const callDoc = await db.collection('calls').doc(callId).get();
+            if (callDoc.exists) {
+              const callData = callDoc.data();
+              const callStatus = callData.status;
+              if (['cancelled', 'declined', 'ended', 'completed', 'timeout', 'timeout_heartbeat'].includes(callStatus)) {
+                logger.info(`Skipping stale billing for ${callId} — already ${callStatus} in Firestore`);
+                deleteCallTimer(callId);
+                deleteActiveCall(callId);
+                await removeCallTimerFromRedis(callId);
+                continue;
+              }
+            }
+          }
+        } catch (checkErr) {
+          logger.warn(`Could not verify call status for ${callId}: ${checkErr.message} — proceeding with stale billing`);
+        }
+
         staleCallsFound++;
         logger.warn(`STALE CALL DETECTED: ${callId} - No heartbeat for ${Math.round(timeSinceLastHeartbeat / 1000)}s`);
 
-        // Stop the timer interval
-        if (timer.interval) clearInterval(timer.interval);
         const finalDuration = timer.durationSeconds || 0;
         const coinsToDeduct = Math.ceil(finalDuration * (timer.coinRate || 0));
 

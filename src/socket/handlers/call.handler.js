@@ -101,6 +101,18 @@ export function registerCallHandlers(io, socket) {
       return;
     }
 
+    // STEP 0: Check if caller already has an active/pending call (prevent duplicates)
+    const callerStatus = getUserStatus(callerId);
+    if (callerStatus && (callerStatus.status === 'busy' || callerStatus.status === 'ringing')) {
+      logger.warn(`DUPLICATE CALL BLOCKED: Caller ${callerId} already has status=${callerStatus.status}, callId=${callerStatus.currentCallId}`);
+      socket.emit('call_failed', {
+        callId: callId || `call_${Date.now()}`,
+        reason: 'You already have an active call',
+        is_busy: true
+      });
+      return;
+    }
+
     // STEP 1: Check recipient status
     const recipientStatus = getUserStatus(recipientId);
     const recipientConnection = getConnectedUser(recipientId);
@@ -456,6 +468,14 @@ export function registerCallHandlers(io, socket) {
       });
     }
 
+    // Stop and delete call timer to prevent stale billing of declined calls
+    const declineTimer = getCallTimer(callId);
+    if (declineTimer) {
+      if (declineTimer.interval) clearInterval(declineTimer.interval);
+      deleteCallTimer(callId);
+      logger.info(`Call timer deleted for declined call: ${callId}`);
+    }
+
     completeCall(callId, {
       status: 'declined',
       declinedAt: call.declinedAt,
@@ -580,6 +600,14 @@ export function registerCallHandlers(io, socket) {
           reason: 'cancelled',
           endedAt: call.cancelledAt.toISOString()
         });
+      }
+
+      // Stop and delete call timer to prevent stale billing of cancelled calls
+      const cancelTimer = getCallTimer(callId);
+      if (cancelTimer) {
+        if (cancelTimer.interval) clearInterval(cancelTimer.interval);
+        deleteCallTimer(callId);
+        logger.info(`Call timer deleted for cancelled call: ${callId}`);
       }
 
       completeCall(callId, {
