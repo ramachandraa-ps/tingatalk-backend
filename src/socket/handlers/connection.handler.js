@@ -3,8 +3,8 @@ import { getFirestore, admin } from '../../config/firebase.js';
 import {
   setConnectedUser, getConnectedUser, getAllConnectedUsers,
   setUserStatus, getUserStatus,
-  getActiveCall,
-  getCallTimer, deleteCallTimer,
+  getActiveCall, getAllActiveCalls,
+  getCallTimer, deleteCallTimer, getAllCallTimers,
   startDisconnectTimeout, cancelDisconnectTimeout,
   completeCall, setCallTimer,
   forceSetUnavailable,
@@ -77,6 +77,28 @@ export function registerConnectionHandlers(io, socket) {
       connectedAt: new Date(),
       isOnline: true
     });
+
+    // Fix 5: Orphan timer cleanup — if user is reconnecting and has any timers
+    // for calls they're no longer in (status not busy), delete those orphan timers
+    try {
+      const userStatus = getUserStatus(userId);
+      const userIsInActiveCall = userStatus && userStatus.status === 'busy' && userStatus.currentCallId;
+      const allTimers = getAllCallTimers();
+      for (const [timerCallId, timerData] of allTimers.entries()) {
+        const isUserCaller = timerData.callerId === userId;
+        const isUserRecipient = timerData.recipientId === userId;
+        if (!isUserCaller && !isUserRecipient) continue;
+
+        // If user is not in this specific call, the timer is an orphan
+        if (!userIsInActiveCall || userStatus.currentCallId !== timerCallId) {
+          if (timerData.interval) clearInterval(timerData.interval);
+          deleteCallTimer(timerCallId);
+          logger.info(`Orphan timer cleaned for ${userId} on reconnect: ${timerCallId}`);
+        }
+      }
+    } catch (orphanErr) {
+      logger.warn(`Orphan timer cleanup error for ${userId}: ${orphanErr.message}`);
+    }
 
     // Set user status from Firestore preference
     // Read availabilityPreference (user's toggle choice) — NOT isAvailable (system-managed)
@@ -243,13 +265,19 @@ export function registerConnectionHandlers(io, socket) {
                   }
                   logger.info(`Deducted ${actualDeduction} coins from ${call.callerId} for disconnected call`);
 
-                  // Record female earnings for disconnect-ended calls
+                  // Fix 4: symmetric billing — calculate actual billed seconds based on what was charged
+                  let billedSeconds = durationSeconds;
+                  if (actualDeduction < coinsDeducted && coinRate > 0) {
+                    billedSeconds = Math.floor(actualDeduction / coinRate);
+                  }
+
+                  // Record female earnings for disconnect-ended calls (based on actual billed seconds)
                   const recipientId = call.recipientId || serverTimer.recipientId;
-                  if (recipientId && durationSeconds > 0) {
+                  if (recipientId && billedSeconds > 0) {
                     try {
                       const callType = serverTimer.callType || call.callType || 'audio';
                       const earningRate = callType === 'video' ? FEMALE_EARNING_RATES.video : FEMALE_EARNING_RATES.audio;
-                      const earningAmount = parseFloat((durationSeconds * earningRate).toFixed(2));
+                      const earningAmount = parseFloat((billedSeconds * earningRate).toFixed(2));
                       const dateKey = new Date().toISOString().split('T')[0];
                       const femaleEarningsRef = db.collection('female_earnings').doc(recipientId);
 
@@ -257,7 +285,7 @@ export function registerConnectionHandlers(io, socket) {
                         totalEarnings: admin.firestore.FieldValue.increment(earningAmount),
                         availableBalance: admin.firestore.FieldValue.increment(earningAmount),
                         totalCalls: admin.firestore.FieldValue.increment(1),
-                        totalDurationSeconds: admin.firestore.FieldValue.increment(durationSeconds),
+                        totalDurationSeconds: admin.firestore.FieldValue.increment(billedSeconds),
                         lastCallAt: admin.firestore.FieldValue.serverTimestamp(),
                         lastUpdated: admin.firestore.FieldValue.serverTimestamp()
                       }, { merge: true });
@@ -266,7 +294,7 @@ export function registerConnectionHandlers(io, socket) {
                         date: dateKey,
                         earnings: admin.firestore.FieldValue.increment(earningAmount),
                         calls: admin.firestore.FieldValue.increment(1),
-                        durationSeconds: admin.firestore.FieldValue.increment(durationSeconds),
+                        durationSeconds: admin.firestore.FieldValue.increment(billedSeconds),
                         lastUpdated: admin.firestore.FieldValue.serverTimestamp()
                       }, { merge: true });
 
@@ -275,7 +303,7 @@ export function registerConnectionHandlers(io, socket) {
                         callId,
                         callerId: call.callerId,
                         callType,
-                        durationSeconds,
+                        durationSeconds: billedSeconds,
                         amount: earningAmount,
                         currency: 'INR',
                         ratePerSecond: earningRate,
@@ -285,7 +313,7 @@ export function registerConnectionHandlers(io, socket) {
                         source: 'disconnect_recovery'
                       });
 
-                      logger.info(`Female earnings recorded for disconnect call ${callId}: ₹${earningAmount} to ${recipientId}`);
+                      logger.info(`Female earnings recorded for disconnect call ${callId}: ₹${earningAmount} (based on ${billedSeconds}s actual billed) to ${recipientId}`);
                     } catch (earningsErr) {
                       logger.error(`Failed to record female earnings on disconnect: ${earningsErr.message}`);
                     }
@@ -297,7 +325,7 @@ export function registerConnectionHandlers(io, socket) {
                     callerId: call.callerId,
                     recipientId,
                     callType: serverTimer.callType || call.callType || 'audio',
-                    durationSeconds,
+                    durationSeconds: billedSeconds,
                     coinsDeducted: actualDeduction,
                     status: 'completed',
                     endReason: 'connection_lost',
