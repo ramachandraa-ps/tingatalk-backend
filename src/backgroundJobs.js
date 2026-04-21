@@ -15,6 +15,7 @@ import {
   FEMALE_EARNING_RATES
 } from './shared/constants.js';
 import { updateCallLogs } from './utils/callLogUtil.js';
+import { startMarketingNotificationJob, stopMarketingNotificationJob } from './features/notifications/marketingNotification.js';
 
 let heartbeatIntervalId = null;
 let memoryCheckIntervalId = null;
@@ -330,6 +331,7 @@ export function startBackgroundJobs(io) {
   startHeartbeatMonitor(io);
   startMemoryProtection();
   startStaleConnectionCleanup(io);
+  startMarketingNotificationJob();
   logger.info(`Background jobs started (heartbeat timeout: ${HEARTBEAT_TIMEOUT_MS / 1000}s, check interval: ${HEARTBEAT_CHECK_INTERVAL_MS / 1000}s)`);
 }
 
@@ -337,5 +339,6 @@ export function stopBackgroundJobs() {
   if (heartbeatIntervalId) clearInterval(heartbeatIntervalId);
   if (memoryCheckIntervalId) clearInterval(memoryCheckIntervalId);
   if (staleCleanupIntervalId) clearInterval(staleCleanupIntervalId);
+  stopMarketingNotificationJob();
   logger.info('Background jobs stopped');
 }
