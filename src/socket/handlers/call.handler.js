@@ -364,13 +364,6 @@ export function registerCallHandlers(io, socket) {
       return;
     }
 
-    // Cancel any pre-accept grace-period timer (see connection.handler.js) — user
-    // reconnected and accepted, so the grace cleanup must not fire.
-    if (call._graceTimer) {
-      clearTimeout(call._graceTimer);
-      call._graceTimer = null;
-    }
-
     // Mark both users as busy
     setUserStatus(callerId, { status: 'busy', currentCallId: callId, lastStatusChange: new Date() });
     setUserStatus(recipientId, { status: 'busy', currentCallId: callId, lastStatusChange: new Date() });
@@ -494,12 +487,6 @@ export function registerCallHandlers(io, socket) {
       return;
     }
 
-    // Cancel any pre-accept grace-period timer — user explicitly declined.
-    if (call._graceTimer) {
-      clearTimeout(call._graceTimer);
-      call._graceTimer = null;
-    }
-
     call.status = 'declined';
     call.declinedAt = new Date();
 
@@ -546,7 +533,6 @@ export function registerCallHandlers(io, socket) {
       // Call already cleaned up (by other party's end_call, timeout, or stale detector)
       // Still persist isAvailable=true for the user who sent this event
       logger.info(`end_call for already-cleaned call ${callId} from ${userId} — persisting availability`);
-      // (No grace timer to clear — call is gone from memory.)
       if (userId) {
         setUserStatus(userId, { status: 'available', currentCallId: null, lastStatusChange: new Date() });
         try {
@@ -562,12 +548,6 @@ export function registerCallHandlers(io, socket) {
         }
       }
       return;
-    }
-
-    // Cancel any pre-accept grace-period timer — user explicitly ended the call.
-    if (call._graceTimer) {
-      clearTimeout(call._graceTimer);
-      call._graceTimer = null;
     }
 
     call.status = 'ended';
@@ -631,12 +611,6 @@ export function registerCallHandlers(io, socket) {
     const call = getActiveCall(callId);
 
     if (call) {
-      // Cancel any pre-accept grace-period timer — caller explicitly gave up.
-      if (call._graceTimer) {
-        clearTimeout(call._graceTimer);
-        call._graceTimer = null;
-      }
-
       call.status = 'cancelled';
       call.cancelledAt = new Date();
       call.cancelledBy = userId;
