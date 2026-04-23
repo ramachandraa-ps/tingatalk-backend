@@ -377,12 +377,49 @@ export function registerCallHandlers(io, socket) {
       const coinRate = call.callType === 'video' ? COIN_RATES.video : COIN_RATES.audio;
       const startTime = Date.now();
 
-      const interval = setInterval(() => {
+      const interval = setInterval(async () => {
         const timer = getCallTimer(callId);
         if (timer) {
           timer.durationSeconds++;
+
+          // Fix 6: Mid-call balance check every 30s — auto-end if caller runs out
           if (timer.durationSeconds % 30 === 0) {
             logger.info(`Call ${callId} duration: ${timer.durationSeconds}s (auto-started on accept)`);
+            try {
+              const db = getFirestore();
+              if (db && timer.callerId) {
+                const userDoc = await db.collection('users').doc(timer.callerId).get();
+                const balance = userDoc.exists ? (userDoc.data().coins ?? 0) : 0;
+                const projectedNeed = Math.ceil(60 * timer.coinRate); // 1 min buffer
+                if (balance < projectedNeed) {
+                  logger.warn(`AUTO-END: Caller ${timer.callerId} balance (${balance}) below 1-min buffer (${projectedNeed}) for call ${callId}`);
+                  clearInterval(timer.interval);
+                  // Mark call as ended due to insufficient balance
+                  const callObj = getActiveCall(callId);
+                  if (callObj) callObj.status = 'completed';
+                  // Notify both users
+                  const callerConn = getConnectedUser(timer.callerId);
+                  const recipientConn = getConnectedUser(timer.recipientId);
+                  const endPayload = { callId, endedBy: 'server', reason: 'insufficient_balance', duration: timer.durationSeconds };
+                  if (callerConn) io.to(callerConn.socketId).emit('call_ended', endPayload);
+                  if (recipientConn) io.to(recipientConn.socketId).emit('call_ended', endPayload);
+                  // Mark in Firestore
+                  await db.collection('calls').doc(callId).update({
+                    status: 'ended',
+                    durationSeconds: timer.durationSeconds,
+                    endedAt: admin.firestore.FieldValue.serverTimestamp(),
+                    endReason: 'insufficient_balance'
+                  }).catch(() => {});
+                  // Reset statuses
+                  setUserStatus(timer.callerId, { status: 'available', currentCallId: null, lastStatusChange: new Date() });
+                  setUserStatus(timer.recipientId, { status: 'available', currentCallId: null, lastStatusChange: new Date() });
+                  deleteCallTimer(callId);
+                  return;
+                }
+              }
+            } catch (balanceErr) {
+              logger.warn(`Mid-call balance check failed for ${callId}: ${balanceErr.message}`);
+            }
           }
         }
       }, 1000);
@@ -618,17 +655,29 @@ export function registerCallHandlers(io, socket) {
         endedAt: call.cancelledAt
       });
     } else {
-      // Even if not in memory, update Firestore
+      // Even if not in memory, clean up timer if it exists (orphan protection)
+      const orphanTimer = getCallTimer(callId);
+      if (orphanTimer) {
+        if (orphanTimer.interval) clearInterval(orphanTimer.interval);
+        deleteCallTimer(callId);
+        logger.info(`Orphan call timer deleted for cancelled call: ${callId}`);
+      }
+
+      // Synchronously update Firestore to ensure status is set before stale detector runs
       const db = getFirestore();
       if (db) {
-        db.collection('calls').doc(callId).update({
-          status: 'cancelled',
-          cancelledAt: new Date(),
-          cancelledBy: userId,
-          cancelReason: reason,
-          endedAt: new Date(),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        }).catch(err => logger.error(`Error updating cancelled call: ${err.message}`));
+        try {
+          await db.collection('calls').doc(callId).update({
+            status: 'cancelled',
+            cancelledAt: new Date(),
+            cancelledBy: userId,
+            cancelReason: reason,
+            endedAt: new Date(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+          });
+        } catch (err) {
+          logger.error(`Error updating cancelled call: ${err.message}`);
+        }
       }
 
       // Still notify recipient

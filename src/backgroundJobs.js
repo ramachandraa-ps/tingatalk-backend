@@ -42,6 +42,31 @@ function startHeartbeatMonitor(io) {
         // Stop the timer interval immediately
         if (timer.interval) clearInterval(timer.interval);
 
+        const rawDuration = timer.durationSeconds || 0;
+        const MAX_CALL_DURATION_SECONDS = 3600; // 60 min hard cap
+
+        // FIX 3: Hard cap — if duration exceeds 60 min, this is a runaway timer, don't bill
+        if (rawDuration > MAX_CALL_DURATION_SECONDS) {
+          logger.warn(`RUNAWAY TIMER DETECTED: ${callId} - Duration ${rawDuration}s exceeds ${MAX_CALL_DURATION_SECONDS}s cap. Discarding without billing.`);
+          deleteCallTimer(callId);
+          deleteActiveCall(callId);
+          await removeCallTimerFromRedis(callId);
+          // Update Firestore to mark as cancelled-runaway
+          try {
+            const db = getFirestore();
+            if (db) {
+              await db.collection('calls').doc(callId).update({
+                status: 'timeout_runaway',
+                durationSeconds: 0,
+                coinsDeducted: 0,
+                endedAt: admin.firestore.FieldValue.serverTimestamp(),
+                endReason: 'Runaway timer detected - call discarded'
+              }).catch(() => {});
+            }
+          } catch (e) {}
+          continue;
+        }
+
         // Check if this call was already cancelled/declined/ended in Firestore before billing
         try {
           const db = getFirestore();
@@ -50,7 +75,7 @@ function startHeartbeatMonitor(io) {
             if (callDoc.exists) {
               const callData = callDoc.data();
               const callStatus = callData.status;
-              if (['cancelled', 'declined', 'ended', 'completed', 'timeout', 'timeout_heartbeat'].includes(callStatus)) {
+              if (['cancelled', 'declined', 'ended', 'completed', 'timeout', 'timeout_heartbeat', 'timeout_runaway'].includes(callStatus)) {
                 logger.info(`Skipping stale billing for ${callId} — already ${callStatus} in Firestore`);
                 deleteCallTimer(callId);
                 deleteActiveCall(callId);
@@ -66,12 +91,14 @@ function startHeartbeatMonitor(io) {
         staleCallsFound++;
         logger.warn(`STALE CALL DETECTED: ${callId} - No heartbeat for ${Math.round(timeSinceLastHeartbeat / 1000)}s`);
 
-        const finalDuration = timer.durationSeconds || 0;
+        const finalDuration = rawDuration;
         const coinsToDeduct = Math.ceil(finalDuration * (timer.coinRate || 0));
 
         logger.info(`Auto-ending stale call ${callId}: ${finalDuration}s, ${coinsToDeduct} coins`);
 
-        // Deduct coins and update Firestore
+        // Deduct coins and update Firestore — use ACTUAL deduction for symmetric billing (Fix 4)
+        let actualCoinsDeducted = 0;
+        let actualBilledSeconds = finalDuration;
         try {
           const db = getFirestore();
           if (db && timer.callerId) {
@@ -80,7 +107,8 @@ function startHeartbeatMonitor(io) {
               const userDoc = await transaction.get(userRef);
               if (userDoc.exists) {
                 const currentBalance = userDoc.data().coins ?? 0;
-                const newBalance = Math.max(0, currentBalance - coinsToDeduct);
+                actualCoinsDeducted = Math.min(coinsToDeduct, Math.max(0, currentBalance));
+                const newBalance = currentBalance - actualCoinsDeducted;
                 transaction.update(userRef, {
                   coins: newBalance,
                   lastDeductedAt: admin.firestore.FieldValue.serverTimestamp()
@@ -88,21 +116,26 @@ function startHeartbeatMonitor(io) {
               }
             });
 
+            // Fix 4: Calculate actual billed seconds based on what was actually charged
+            if (actualCoinsDeducted < coinsToDeduct && timer.coinRate > 0) {
+              actualBilledSeconds = Math.floor(actualCoinsDeducted / timer.coinRate);
+            }
+
             await db.collection('calls').doc(callId).update({
               status: 'timeout_heartbeat',
-              durationSeconds: finalDuration,
-              coinsDeducted: coinsToDeduct,
+              durationSeconds: actualBilledSeconds,
+              coinsDeducted: actualCoinsDeducted,
               endedAt: admin.firestore.FieldValue.serverTimestamp(),
               endReason: 'No heartbeat received - connection lost'
             });
-            logger.info(`Stale call ${callId} billed and closed: ${coinsToDeduct} coins deducted`);
+            logger.info(`Stale call ${callId} billed and closed: ${actualCoinsDeducted} coins deducted (requested: ${coinsToDeduct}, actual billed seconds: ${actualBilledSeconds})`);
 
-            // Record female earnings for stale calls
-            if (timer.recipientId && finalDuration > 0) {
+            // Fix 4: Record female earnings based on ACTUAL billed seconds (symmetric)
+            if (timer.recipientId && actualBilledSeconds > 0) {
               try {
                 const callType = timer.callType || 'audio';
                 const earningRate = callType === 'video' ? FEMALE_EARNING_RATES.video : FEMALE_EARNING_RATES.audio;
-                const earningAmount = parseFloat((finalDuration * earningRate).toFixed(2));
+                const earningAmount = parseFloat((actualBilledSeconds * earningRate).toFixed(2));
                 const dateKey = new Date().toISOString().split('T')[0];
                 const femaleEarningsRef = db.collection('female_earnings').doc(timer.recipientId);
 
@@ -110,7 +143,7 @@ function startHeartbeatMonitor(io) {
                   totalEarnings: admin.firestore.FieldValue.increment(earningAmount),
                   availableBalance: admin.firestore.FieldValue.increment(earningAmount),
                   totalCalls: admin.firestore.FieldValue.increment(1),
-                  totalDurationSeconds: admin.firestore.FieldValue.increment(finalDuration),
+                  totalDurationSeconds: admin.firestore.FieldValue.increment(actualBilledSeconds),
                   lastCallAt: admin.firestore.FieldValue.serverTimestamp(),
                   lastUpdated: admin.firestore.FieldValue.serverTimestamp()
                 }, { merge: true });
@@ -119,7 +152,7 @@ function startHeartbeatMonitor(io) {
                   date: dateKey,
                   earnings: admin.firestore.FieldValue.increment(earningAmount),
                   calls: admin.firestore.FieldValue.increment(1),
-                  durationSeconds: admin.firestore.FieldValue.increment(finalDuration),
+                  durationSeconds: admin.firestore.FieldValue.increment(actualBilledSeconds),
                   lastUpdated: admin.firestore.FieldValue.serverTimestamp()
                 }, { merge: true });
 
@@ -128,7 +161,7 @@ function startHeartbeatMonitor(io) {
                   callId,
                   callerId: timer.callerId,
                   callType,
-                  durationSeconds: finalDuration,
+                  durationSeconds: actualBilledSeconds,
                   amount: earningAmount,
                   currency: 'INR',
                   ratePerSecond: earningRate,
@@ -138,7 +171,7 @@ function startHeartbeatMonitor(io) {
                   source: 'stale_call_recovery'
                 });
 
-                logger.info(`Female earnings recorded for stale call ${callId}: ₹${earningAmount} to ${timer.recipientId}`);
+                logger.info(`Female earnings recorded for stale call ${callId}: ₹${earningAmount} (based on actual billed ${actualBilledSeconds}s) to ${timer.recipientId}`);
               } catch (earningsError) {
                 logger.error(`Failed to record female earnings for stale call ${callId}: ${earningsError.message}`);
               }
@@ -150,8 +183,8 @@ function startHeartbeatMonitor(io) {
               callerId: timer.callerId,
               recipientId: timer.recipientId,
               callType: timer.callType || 'audio',
-              durationSeconds: finalDuration,
-              coinsDeducted,
+              durationSeconds: actualBilledSeconds,
+              coinsDeducted: actualCoinsDeducted,
               status: 'completed',
               endReason: 'connection_lost',
               source: 'stale_call_recovery',

@@ -106,6 +106,19 @@ router.post('/payouts', async (req, res) => {
       pendingAmount: admin.firestore.FieldValue.increment(amount)
     }, { merge: true });
 
+    // Write claim record to female_earnings transactions for payout history display
+    await earningsRef.collection('transactions').doc(docRef.id).set({
+      type: 'claim',
+      amount,
+      currency,
+      status: 'pending',
+      method: bankDetails?.upiId ? 'upi' : 'bank_transfer',
+      bankDetails: bankDetails || null,
+      requestId: docRef.id,
+      createdAt: new Date(),
+      requestedAt: new Date(),
+    });
+
     logger.info(`Payout request ${docRef.id} created for user ${userId}, amount: ${amount} ${currency}`);
 
     res.json({

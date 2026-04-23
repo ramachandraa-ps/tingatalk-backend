@@ -148,10 +148,41 @@ router.post('/start', async (req, res) => {
     };
     await db.collection('calls').doc(callId).set(callData, { merge: true });
 
-    // Start timer
-    const interval = setInterval(() => {
+    // Start timer with mid-call balance check (Fix 6)
+    const ioApp = req.app.get('io');
+    const interval = setInterval(async () => {
       const timer = getCallTimer(callId);
-      if (timer) timer.durationSeconds++;
+      if (!timer) return;
+      timer.durationSeconds++;
+
+      // Mid-call balance check every 30s
+      if (timer.durationSeconds % 30 === 0) {
+        try {
+          const userDoc = await db.collection('users').doc(timer.callerId).get();
+          const balance = userDoc.exists ? (userDoc.data().coins ?? 0) : 0;
+          const projectedNeed = Math.ceil(60 * timer.coinRate);
+          if (balance < projectedNeed) {
+            logger.warn(`AUTO-END: Caller ${timer.callerId} balance (${balance}) below 1-min buffer (${projectedNeed}) for call ${callId}`);
+            clearInterval(timer.interval);
+            const callerConn = getConnectedUser(timer.callerId);
+            const recipientConn = getConnectedUser(timer.recipientId);
+            const endPayload = { callId, endedBy: 'server', reason: 'insufficient_balance', duration: timer.durationSeconds };
+            if (ioApp && callerConn) ioApp.to(callerConn.socketId).emit('call_ended', endPayload);
+            if (ioApp && recipientConn) ioApp.to(recipientConn.socketId).emit('call_ended', endPayload);
+            await db.collection('calls').doc(callId).update({
+              status: 'ended',
+              durationSeconds: timer.durationSeconds,
+              endedAt: admin.firestore.FieldValue.serverTimestamp(),
+              endReason: 'insufficient_balance'
+            }).catch(() => {});
+            setUserStatus(timer.callerId, { status: 'available', currentCallId: null, lastStatusChange: new Date() });
+            setUserStatus(timer.recipientId, { status: 'available', currentCallId: null, lastStatusChange: new Date() });
+            deleteCallTimer(callId);
+          }
+        } catch (e) {
+          logger.warn(`Mid-call balance check failed for ${callId}: ${e.message}`);
+        }
+      }
     }, 1000);
 
     setCallTimer(callId, {
