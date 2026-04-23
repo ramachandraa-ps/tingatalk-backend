@@ -83,3 +83,10 @@ export const CALL_STATUS = {
 export const ENDED_CALL_STATUSES = [
   'ended', 'declined', 'missed', 'cancelled', 'timeout', 'no_answer'
 ];
+
+// Pre-accept call statuses — call is in setup phase, not yet joined on Twilio.
+// A disconnect during this window gets a grace period (DISCONNECT_TIMEOUT_MS) before
+// the call is killed, so brief network flaps don't fail calls that would otherwise connect.
+export const PRE_ACCEPT_CALL_STATUSES = [
+  'initiated', 'ringing', 'pending_fcm', 'ringing_fcm'
+];

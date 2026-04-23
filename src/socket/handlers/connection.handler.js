@@ -10,7 +10,7 @@ import {
   forceSetUnavailable,
   confirmBackgrounded
 } from '../state/connectionManager.js';
-import { COIN_RATES, FEMALE_EARNING_RATES } from '../../shared/constants.js';
+import { COIN_RATES, FEMALE_EARNING_RATES, PRE_ACCEPT_CALL_STATUSES, ENDED_CALL_STATUSES, DISCONNECT_TIMEOUT_MS } from '../../shared/constants.js';
 import { updateCallLogs } from '../../utils/callLogUtil.js';
 
 export function registerConnectionHandlers(io, socket) {
@@ -211,9 +211,97 @@ export function registerConnectionHandlers(io, socket) {
         const callId = currentStatus.currentCallId;
         const call = getActiveCall(callId);
 
-        if (call && call.status === 'completed') {
-          logger.info(`Call ${callId} already completed — skipping disconnect billing`);
+        // GRACE PERIOD FOR PRE-ACCEPT DISCONNECTS
+        // If a participant's socket drops while the call is still in setup phase
+        // (initiated/ringing/pending_fcm/ringing_fcm) — do NOT instantly kill the call.
+        // Android backgrounding + reconnect storms were causing brief socket drops that
+        // killed calls before the recipient could tap Accept (see log forensics 2026-04-23:
+        // 169/201 male→female calls failed this way, 84% failure rate).
+        //
+        // Schedule cleanup after DISCONNECT_TIMEOUT_MS. If the user reconnects and the
+        // call transitions to 'accepted'/'active' within that window, the deferred
+        // cleanup is a no-op. Existing billing/cleanup logic for mid-call disconnect
+        // (call.status === 'accepted'/'active') is unchanged.
+        if (call && PRE_ACCEPT_CALL_STATUSES.includes(call.status)) {
+          // Debounce: if a prior grace timer exists for this call (e.g. same user
+          // disconnected twice in quick succession during a reconnect storm), cancel it
+          // and schedule fresh. Prevents duplicate work and redundant log lines.
+          if (call._graceTimer) {
+            clearTimeout(call._graceTimer);
+            logger.debug(`Grace period: cleared stale grace timer for call ${callId}`);
+          }
+
+          logger.info(`Grace period: call ${callId} in pre-accept state '${call.status}' — deferring cleanup ${DISCONNECT_TIMEOUT_MS / 1000}s for potential reconnect from ${userId}`);
+
+          call._graceTimer = setTimeout(() => {
+            const laterCall = getActiveCall(callId);
+            if (!laterCall) {
+              logger.debug(`Grace period: call ${callId} already removed — no cleanup needed`);
+              return;
+            }
+            // Clear our stored handle on the call object now that we're firing
+            laterCall._graceTimer = null;
+
+            if (laterCall.status === 'accepted' || laterCall.status === 'active') {
+              logger.debug(`Grace period: call ${callId} was accepted during grace window — cleanup skipped`);
+              return;
+            }
+            if (ENDED_CALL_STATUSES.includes(laterCall.status) || laterCall.status === 'completed' || laterCall.status === 'missed') {
+              logger.debug(`Grace period: call ${callId} already terminated (status='${laterCall.status}') — cleanup skipped`);
+              return;
+            }
+            // Call is STILL in pre-accept state after grace window — treat as genuine abandon.
+            // Mark as missed so caller-side UI gets the usual timeout/missed experience.
+            logger.warn(`Grace period expired: call ${callId} still '${laterCall.status}' after ${DISCONNECT_TIMEOUT_MS / 1000}s — completing as missed`);
+            laterCall.status = 'missed';
+
+            // Notify caller that the call ended (idempotent on caller UI — caller may
+            // have already fired cancel_call but end-event handlers are expected to be
+            // idempotent on terminal states).
+            const callerConn = getConnectedUser(laterCall.callerId);
+            if (callerConn && callerConn.isOnline) {
+              io.to(callerConn.socketId).emit('call_timeout', {
+                callId,
+                reason: 'recipient_disconnected',
+                endedAt: new Date().toISOString()
+              });
+            }
+
+            // Status reset: ONLY reset user statuses to 'available' if the user is
+            // actually still online. If they're offline, let the user-presence cleanup
+            // (startDisconnectTimeout below) own their state so we don't overwrite
+            // 'disconnected' with 'available' for a user whose socket is dead.
+            const callerOnline = !!getConnectedUser(laterCall.callerId)?.isOnline;
+            const recipientOnline = !!getConnectedUser(laterCall.recipientId)?.isOnline;
+            if (callerOnline) {
+              setUserStatus(laterCall.callerId, { status: 'available', currentCallId: null, lastStatusChange: new Date() });
+            }
+            if (recipientOnline) {
+              setUserStatus(laterCall.recipientId, { status: 'available', currentCallId: null, lastStatusChange: new Date() });
+            }
+
+            // Complete call record (no billing — call was never accepted)
+            completeCall(callId, {
+              status: 'missed',
+              endReason: 'recipient_disconnected_before_accept',
+              disconnectedBy: userId,
+              disconnectedAt: new Date().toISOString(),
+              endedAt: new Date().toISOString(),
+              durationSeconds: 0,
+              coinsDeducted: 0
+            });
+          }, DISCONNECT_TIMEOUT_MS);
+
+          // IMPORTANT: skip the rest of the in-call cleanup for this call.
+          // The user-level cleanup (setUserStatus disconnected, startDisconnectTimeout)
+          // below still runs — that's about user presence, not call state.
+        }
+        else if (call && (call.status === 'completed' || ENDED_CALL_STATUSES.includes(call.status))) {
+          // Call already terminated by another path (cancelled/ended/declined/timeout/missed/completed)
+          // — skip disconnect billing, just let user-level cleanup below run.
+          logger.debug(`Call ${callId} already in terminal state '${call.status}' — skipping disconnect billing`);
         } else if (call) {
+          // Call is in accepted/active/disconnected/failed — run the full billing cleanup path.
           logger.warn(`User ${userId} disconnected during active call ${callId}`);
 
           // Notify other participants
