@@ -92,29 +92,34 @@ function startHeartbeatMonitor(io) {
         logger.warn(`STALE CALL DETECTED: ${callId} - No heartbeat for ${Math.round(timeSinceLastHeartbeat / 1000)}s`);
 
         const finalDuration = rawDuration;
-        const coinsToDeduct = Math.ceil(finalDuration * (timer.coinRate || 0));
+        const isTrialStale = timer.isTrialCall === true;
+        // For trial calls: zero coins regardless of duration
+        const coinsToDeduct = isTrialStale ? 0 : Math.ceil(finalDuration * (timer.coinRate || 0));
 
-        logger.info(`Auto-ending stale call ${callId}: ${finalDuration}s, ${coinsToDeduct} coins`);
+        logger.info(`Auto-ending stale call ${callId}: ${finalDuration}s, ${coinsToDeduct} coins${isTrialStale ? ' [TRIAL]' : ''}`);
 
         // Deduct coins and update Firestore — use ACTUAL deduction for symmetric billing (Fix 4)
+        // For trial calls: zero deduction
         let actualCoinsDeducted = 0;
         let actualBilledSeconds = finalDuration;
         try {
           const db = getFirestore();
           if (db && timer.callerId) {
-            await db.runTransaction(async (transaction) => {
-              const userRef = db.collection('users').doc(timer.callerId);
-              const userDoc = await transaction.get(userRef);
-              if (userDoc.exists) {
-                const currentBalance = userDoc.data().coins ?? 0;
-                actualCoinsDeducted = Math.min(coinsToDeduct, Math.max(0, currentBalance));
-                const newBalance = currentBalance - actualCoinsDeducted;
-                transaction.update(userRef, {
-                  coins: newBalance,
-                  lastDeductedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
-              }
-            });
+            if (!isTrialStale) {
+              await db.runTransaction(async (transaction) => {
+                const userRef = db.collection('users').doc(timer.callerId);
+                const userDoc = await transaction.get(userRef);
+                if (userDoc.exists) {
+                  const currentBalance = userDoc.data().coins ?? 0;
+                  actualCoinsDeducted = Math.min(coinsToDeduct, Math.max(0, currentBalance));
+                  const newBalance = currentBalance - actualCoinsDeducted;
+                  transaction.update(userRef, {
+                    coins: newBalance,
+                    lastDeductedAt: admin.firestore.FieldValue.serverTimestamp()
+                  });
+                }
+              });
+            }
 
             // Fix 4: Calculate actual billed seconds based on what was actually charged
             if (actualCoinsDeducted < coinsToDeduct && timer.coinRate > 0) {
@@ -125,13 +130,15 @@ function startHeartbeatMonitor(io) {
               status: 'timeout_heartbeat',
               durationSeconds: actualBilledSeconds,
               coinsDeducted: actualCoinsDeducted,
+              isTrialCall: isTrialStale,
+              displayLabel: isTrialStale ? 'Trial Call' : null,
               endedAt: admin.firestore.FieldValue.serverTimestamp(),
-              endReason: 'No heartbeat received - connection lost'
+              endReason: isTrialStale ? 'trial_call_timeout' : 'No heartbeat received - connection lost'
             });
-            logger.info(`Stale call ${callId} billed and closed: ${actualCoinsDeducted} coins deducted (requested: ${coinsToDeduct}, actual billed seconds: ${actualBilledSeconds})`);
+            logger.info(`Stale call ${callId} billed and closed: ${actualCoinsDeducted} coins deducted (requested: ${coinsToDeduct}, actual billed seconds: ${actualBilledSeconds})${isTrialStale ? ' [TRIAL]' : ''}`);
 
-            // Fix 4: Record female earnings based on ACTUAL billed seconds (symmetric)
-            if (timer.recipientId && actualBilledSeconds > 0) {
+            // Fix 4: Record female earnings based on ACTUAL billed seconds (symmetric) — SKIP for trial
+            if (!isTrialStale && timer.recipientId && actualBilledSeconds > 0) {
               try {
                 const callType = timer.callType || 'audio';
                 const earningRate = callType === 'video' ? FEMALE_EARNING_RATES.video : FEMALE_EARNING_RATES.audio;
@@ -175,20 +182,52 @@ function startHeartbeatMonitor(io) {
               } catch (earningsError) {
                 logger.error(`Failed to record female earnings for stale call ${callId}: ${earningsError.message}`);
               }
+            } else if (isTrialStale && timer.recipientId && finalDuration > 0) {
+              // Trial call timed out — record trial transaction (₹0) for female history
+              try {
+                const callType = timer.callType || 'audio';
+                await db.collection('female_earnings').doc(timer.recipientId)
+                  .collection('transactions').doc(callId).set({
+                    type: 'trial_call',
+                    callId,
+                    callerId: timer.callerId,
+                    callType,
+                    isVideoCall: callType === 'video',
+                    durationSeconds: finalDuration,
+                    amount: 0,
+                    currency: 'INR',
+                    isTrialCall: true,
+                    displayLabel: 'Trial Call',
+                    completedAt: new Date().toISOString(),
+                    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                    status: 'completed'
+                  });
+                logger.info(`Trial call timeout transaction recorded for ${timer.recipientId}`);
+              } catch (e) {
+                logger.error(`Failed to record trial call timeout transaction: ${e.message}`);
+              }
             }
 
-            // Update call logs for both users
+            // Update call logs for both users (with trial flag)
             await updateCallLogs({
               callId,
               callerId: timer.callerId,
               recipientId: timer.recipientId,
               callType: timer.callType || 'audio',
-              durationSeconds: actualBilledSeconds,
+              durationSeconds: isTrialStale ? finalDuration : actualBilledSeconds,
               coinsDeducted: actualCoinsDeducted,
               status: 'completed',
-              endReason: 'connection_lost',
-              source: 'stale_call_recovery',
+              endReason: isTrialStale ? 'trial_call_timeout' : 'connection_lost',
+              source: isTrialStale ? 'trial_stale_recovery' : 'stale_call_recovery',
+              isTrialCall: isTrialStale,
+              displayLabel: isTrialStale ? 'Trial Call' : null,
             });
+
+            // Increment male call count to use up trial
+            if (timer.callerId) {
+              const { incrementMaleCallCount } = await import('./utils/trialCallUtil.js');
+              await incrementMaleCallCount(timer.callerId, timer.callType || 'audio');
+            }
           }
         } catch (error) {
           logger.error(`Error closing stale call ${callId}: ${error.message}`);

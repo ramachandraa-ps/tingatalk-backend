@@ -13,6 +13,7 @@ import {
   FEMALE_EARNING_RATES, ENDED_CALL_STATUSES
 } from '../../shared/constants.js';
 import { updateCallLogs } from '../../utils/callLogUtil.js';
+import { checkIsTrialCall, incrementMaleCallCount, TRIAL_CALL_MAX_DURATION_SECONDS } from '../../utils/trialCallUtil.js';
 
 const router = Router();
 
@@ -123,7 +124,15 @@ router.post('/start', async (req, res) => {
     const callerBalance = userData.coins ?? 0;
     const requiredBalance = callType === 'video' ? MIN_BALANCE.video : MIN_BALANCE.audio;
 
-    if (callerBalance < requiredBalance) {
+    // Check if this should be a trial call (new male, first audio/video call)
+    const trialCheck = await checkIsTrialCall(callerId, callType);
+    const isTrial = trialCheck.isTrial;
+    if (isTrial) {
+      logger.info(`TRIAL CALL: ${callId} - Caller ${callerId} (${callType}) - free 60s trial (${trialCheck.reason})`);
+    }
+
+    // Skip balance check for trial calls
+    if (!isTrial && callerBalance < requiredBalance) {
       return res.status(400).json({
         error: 'Insufficient balance',
         currentBalance: callerBalance,
@@ -143,20 +152,69 @@ router.post('/start', async (req, res) => {
       coinRatePerSecond: coinRate,
       startedAt: new Date().toISOString(),
       durationSeconds: 0, coinsDeducted: 0,
+      isTrialCall: isTrial,
+      displayLabel: isTrial ? 'Trial Call' : null,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     };
     await db.collection('calls').doc(callId).set(callData, { merge: true });
 
-    // Start timer with mid-call balance check (Fix 6)
+    // Start timer with mid-call balance check (Fix 6) + trial call 60s hard cap
     const ioApp = req.app.get('io');
     const interval = setInterval(async () => {
       const timer = getCallTimer(callId);
       if (!timer) return;
       timer.durationSeconds++;
 
-      // Mid-call balance check every 30s
-      if (timer.durationSeconds % 30 === 0) {
+      // Trial call: hard 60-second auto-end
+      if (timer.isTrialCall && timer.durationSeconds >= TRIAL_CALL_MAX_DURATION_SECONDS) {
+        logger.info(`TRIAL CALL AUTO-END: ${callId} reached ${TRIAL_CALL_MAX_DURATION_SECONDS}s — ending call`);
+        clearInterval(timer.interval);
+        const callerConn = getConnectedUser(timer.callerId);
+        const recipientConn = getConnectedUser(timer.recipientId);
+        const endPayload = {
+          callId,
+          endedBy: 'server',
+          reason: 'trial_ended',
+          duration: timer.durationSeconds,
+          isTrialCall: true,
+          displayLabel: 'Trial Call',
+        };
+        if (ioApp && callerConn) ioApp.to(callerConn.socketId).emit('call_ended', endPayload);
+        if (ioApp && recipientConn) ioApp.to(recipientConn.socketId).emit('call_ended', endPayload);
+        await db.collection('calls').doc(callId).update({
+          status: 'completed',
+          durationSeconds: timer.durationSeconds,
+          coinsDeducted: 0,
+          isTrialCall: true,
+          displayLabel: 'Trial Call',
+          endedAt: admin.firestore.FieldValue.serverTimestamp(),
+          endReason: 'trial_60s_reached',
+        }).catch(() => {});
+        setUserStatus(timer.callerId, { status: 'available', currentCallId: null, lastStatusChange: new Date() });
+        setUserStatus(timer.recipientId, { status: 'available', currentCallId: null, lastStatusChange: new Date() });
+        // Increment male call count so trial is used up
+        await incrementMaleCallCount(timer.callerId, timer.callType);
+        // Update call logs (with isTrial flag)
+        await updateCallLogs({
+          callId,
+          callerId: timer.callerId,
+          recipientId: timer.recipientId,
+          callType: timer.callType,
+          durationSeconds: timer.durationSeconds,
+          coinsDeducted: 0,
+          status: 'completed',
+          endReason: 'trial_60s_reached',
+          source: 'trial_auto_end',
+          isTrialCall: true,
+          displayLabel: 'Trial Call',
+        });
+        deleteCallTimer(callId);
+        return;
+      }
+
+      // Mid-call balance check every 30s (skip for trial calls — no coins involved)
+      if (!timer.isTrialCall && timer.durationSeconds % 30 === 0) {
         try {
           const userDoc = await db.collection('users').doc(timer.callerId).get();
           const balance = userDoc.exists ? (userDoc.data().coins ?? 0) : 0;
@@ -187,14 +245,18 @@ router.post('/start', async (req, res) => {
 
     setCallTimer(callId, {
       interval, durationSeconds: 0, coinRate, callerId, recipientId,
-      callType, callerName, startTime, lastHeartbeat: Date.now()
+      callType, callerName, startTime, lastHeartbeat: Date.now(),
+      isTrialCall: isTrial,
     });
 
     res.json({
       success: true, callId,
       serverStartTime: new Date().toISOString(),
       callerBalance, coinRate,
-      message: 'Call tracking started on server'
+      isTrialCall: isTrial,
+      trialMaxDurationSeconds: isTrial ? TRIAL_CALL_MAX_DURATION_SECONDS : null,
+      displayLabel: isTrial ? 'Trial Call' : null,
+      message: isTrial ? 'Trial call started (60s max)' : 'Call tracking started on server'
     });
   } catch (error) {
     logger.error('Error starting call:', error);
@@ -359,7 +421,9 @@ router.post('/complete', async (req, res) => {
     // Stop timer
     clearInterval(serverTimer.interval);
     const serverDuration = serverTimer.durationSeconds;
-    const coinsDeducted = Math.ceil(serverDuration * serverTimer.coinRate);
+    const isTrialCall = serverTimer.isTrialCall === true;
+    // For trial calls: zero coins regardless of duration
+    const coinsDeducted = isTrialCall ? 0 : Math.ceil(serverDuration * serverTimer.coinRate);
 
     // Fraud detection
     let fraudDetection = null;
@@ -379,9 +443,9 @@ router.post('/complete', async (req, res) => {
     const effectiveCallerId = finalCallerId || serverTimer.callerId;
     const effectiveRecipientId = finalRecipientId || serverTimer.recipientId;
 
-    // Deduct coins (with negative balance guard)
+    // Deduct coins (with negative balance guard) — SKIP for trial calls
     let actualDeduction = coinsDeducted;
-    if (effectiveCallerId && coinsDeducted > 0) {
+    if (!isTrialCall && effectiveCallerId && coinsDeducted > 0) {
       const userRef = db.collection('users').doc(effectiveCallerId);
       const userDoc = await userRef.get();
       const data = userDoc.data() || {};
@@ -400,6 +464,8 @@ router.post('/complete', async (req, res) => {
       if (actualDeduction < coinsDeducted) {
         logger.warn(`Balance guard: User ${effectiveCallerId} had ${currentBalance} coins, tried to deduct ${coinsDeducted}, deducted ${actualDeduction}`);
       }
+    } else if (isTrialCall) {
+      logger.info(`TRIAL CALL completion: ${finalCallId} - skipping coin deduction (duration: ${serverDuration}s)`);
     }
 
     const newBalance = await (async () => {
@@ -414,11 +480,13 @@ router.post('/complete', async (req, res) => {
       endedAt: new Date().toISOString(),
       endReason: endReason || 'User ended call',
       billingSource: 'server', fraudDetection,
+      isTrialCall: isTrialCall,
+      displayLabel: isTrialCall ? 'Trial Call' : null,
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     }).catch(() => {});
 
-    // Record female earnings
-    if (effectiveRecipientId && serverDuration > 0) {
+    // Record female earnings — SKIP for trial calls (female gets ₹0)
+    if (!isTrialCall && effectiveRecipientId && serverDuration > 0) {
       try {
         const earningRate = serverTimer.callType === 'video' ? FEMALE_EARNING_RATES.video : FEMALE_EARNING_RATES.audio;
         const earningAmount = parseFloat((serverDuration * earningRate).toFixed(2));
@@ -463,6 +531,30 @@ router.post('/complete', async (req, res) => {
         });
       } catch (err) {
         logger.error(`Failed to record female earnings: ${err.message}`);
+      }
+    } else if (isTrialCall && effectiveRecipientId && serverDuration > 0) {
+      // Trial call: record a trial transaction (₹0) so female sees it in history as "Trial Call"
+      try {
+        const femaleEarningsRef = db.collection('female_earnings').doc(effectiveRecipientId);
+        await femaleEarningsRef.collection('transactions').doc(finalCallId).set({
+          type: 'trial_call',
+          callId: finalCallId,
+          callerId: serverTimer.callerId,
+          callerName: serverTimer.callerName || 'Unknown',
+          callType: serverTimer.callType,
+          isVideoCall: serverTimer.callType === 'video',
+          durationSeconds: serverDuration,
+          amount: 0,
+          currency: 'INR',
+          isTrialCall: true,
+          displayLabel: 'Trial Call',
+          completedAt: new Date().toISOString(),
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          status: 'completed'
+        });
+        logger.info(`Trial call transaction recorded for female ${effectiveRecipientId} (₹0 earnings)`);
+      } catch (err) {
+        logger.error(`Failed to record trial call transaction: ${err.message}`);
       }
     }
 
@@ -515,8 +607,13 @@ router.post('/complete', async (req, res) => {
       coinsDeducted: actualDeduction,
       status: 'completed',
       endReason: endReason || 'completed',
-      source: 'normal_completion',
+      source: isTrialCall ? 'trial_completion' : 'normal_completion',
+      isTrialCall,
+      displayLabel: isTrialCall ? 'Trial Call' : null,
     });
+
+    // Increment male call count (for both trial AND normal calls so trial gets used up)
+    await incrementMaleCallCount(serverTimer.callerId, serverTimer.callType);
 
     deleteCallTimer(finalCallId);
 
@@ -527,9 +624,9 @@ router.post('/complete', async (req, res) => {
     // Notify participants that call ended
     const io = req.app.get('io');
     if (io) {
-      // Calculate female earning for the event payload
+      // Calculate female earning for the event payload (₹0 for trial calls)
       const earningRate = serverTimer.callType === 'video' ? FEMALE_EARNING_RATES.video : FEMALE_EARNING_RATES.audio;
-      const femaleEarningAmount = parseFloat((serverDuration * earningRate).toFixed(2));
+      const femaleEarningAmount = isTrialCall ? 0 : parseFloat((serverDuration * earningRate).toFixed(2));
 
       [serverTimer.callerId, serverTimer.recipientId].forEach(uid => {
         const conn = getConnectedUser(uid);
@@ -540,6 +637,8 @@ router.post('/complete', async (req, res) => {
             coinsDeducted: actualDeduction,
             endReason: endReason || 'User ended call',
             callType: serverTimer.callType,
+            isTrialCall,
+            displayLabel: isTrialCall ? 'Trial Call' : null,
             timestamp: new Date().toISOString()
           };
 
@@ -559,8 +658,10 @@ router.post('/complete', async (req, res) => {
       durationSeconds: serverDuration, coinsDeducted: actualDeduction,
       newBalance, coinRate: serverTimer.coinRate,
       callType: serverTimer.callType, source: 'server',
+      isTrialCall,
+      displayLabel: isTrialCall ? 'Trial Call' : null,
       fraudDetection,
-      message: 'Call completed and billed successfully'
+      message: isTrialCall ? 'Trial call completed (no charge)' : 'Call completed and billed successfully'
     });
   } catch (error) {
     logger.error('Error completing call:', error);

@@ -243,12 +243,13 @@ export function registerConnectionHandlers(io, socket) {
             clearInterval(serverTimer.interval);
             const durationSeconds = serverTimer.durationSeconds || 0;
             const coinRate = serverTimer.coinRate || COIN_RATES.audio;
-            const coinsDeducted = Math.ceil(durationSeconds * coinRate);
+            const isTrialCallDisconnect = serverTimer.isTrialCall === true;
+            const coinsDeducted = isTrialCallDisconnect ? 0 : Math.ceil(durationSeconds * coinRate);
 
-            logger.info(`Call ${callId} disconnected - Duration: ${durationSeconds}s, Cost: ${coinsDeducted} coins`);
+            logger.info(`Call ${callId} disconnected - Duration: ${durationSeconds}s, Cost: ${coinsDeducted} coins${isTrialCallDisconnect ? ' [TRIAL CALL]' : ''}`);
 
-            // Deduct coins from caller (non-blocking)
-            if (call.callerId && coinsDeducted > 0) {
+            // Deduct coins from caller (non-blocking) — SKIP for trial calls
+            if (!isTrialCallDisconnect && call.callerId && coinsDeducted > 0) {
               try {
                 const db = getFirestore();
                 if (db) {
@@ -334,6 +335,54 @@ export function registerConnectionHandlers(io, socket) {
                 }
               } catch (deductErr) {
                 logger.error(`Failed to deduct coins on disconnect: ${deductErr.message}`);
+              }
+            }
+
+            // For TRIAL CALLS on disconnect: still write call logs, trial transaction, and increment count
+            if (isTrialCallDisconnect && call.callerId) {
+              try {
+                const db = getFirestore();
+                const recipientId = call.recipientId || serverTimer.recipientId;
+                const callType = serverTimer.callType || call.callType || 'audio';
+                if (db && recipientId && durationSeconds > 0) {
+                  // Trial transaction record (₹0)
+                  await db.collection('female_earnings').doc(recipientId)
+                    .collection('transactions').doc(callId).set({
+                      type: 'trial_call',
+                      callId,
+                      callerId: call.callerId,
+                      callType,
+                      isVideoCall: callType === 'video',
+                      durationSeconds,
+                      amount: 0,
+                      currency: 'INR',
+                      isTrialCall: true,
+                      displayLabel: 'Trial Call',
+                      completedAt: new Date().toISOString(),
+                      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                      status: 'completed'
+                    });
+                }
+                // Update call logs with trial flag
+                await updateCallLogs({
+                  callId,
+                  callerId: call.callerId,
+                  recipientId,
+                  callType,
+                  durationSeconds,
+                  coinsDeducted: 0,
+                  status: 'completed',
+                  endReason: 'trial_disconnected',
+                  source: 'trial_disconnect',
+                  isTrialCall: true,
+                  displayLabel: 'Trial Call',
+                });
+                // Mark trial as used
+                const { incrementMaleCallCount } = await import('../../utils/trialCallUtil.js');
+                await incrementMaleCallCount(call.callerId, callType);
+                logger.info(`Trial call ${callId} disconnected — recorded as trial, count incremented`);
+              } catch (trialErr) {
+                logger.error(`Failed to handle trial call disconnect: ${trialErr.message}`);
               }
             }
 
