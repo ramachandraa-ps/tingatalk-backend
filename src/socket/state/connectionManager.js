@@ -371,12 +371,15 @@ async function _forceUnavailableOnPingTimeout(userId, io) {
   try {
     const db = getFirestore();
     if (db) {
+      // Force-close detected via FCM ping timeout — also clear toggle preference
+      // so it doesn't auto-restore to ON when she reopens the app.
       await db.collection('users').doc(userId).update({
         isAvailable: false,
         isOnline: false,
+        availabilityPreference: false,
         forceCloseDetectedAt: new Date()
       });
-      logger.info(`User ${userId} - Tier 1.5: Force-close detected, isAvailable=false`);
+      logger.info(`User ${userId} - Tier 1.5: Force-close detected, isAvailable=false, availabilityPreference=false`);
 
       io.to('room_male_browse').emit('availability_changed', {
         femaleUserId: userId,
@@ -449,7 +452,17 @@ function _cancelAvailabilityTimeout(userId) {
   }
 }
 
-// Force-close: immediately set isAvailable=false (called from set_unavailable handler)
+// Force-close: immediately set isAvailable=false AND clear toggle preference
+// (called from set_unavailable handler when user kills/swipes the app away)
+//
+// Why we also clear availabilityPreference:
+//   On force-close the user has deliberately exited the app. When they reopen,
+//   the toggle should NOT auto-restore to ON — that would surprise the user
+//   (they might receive calls they didn't intend to). Force-close = explicit
+//   intent to go offline. They must manually toggle ON to receive calls again.
+//
+// This is different from a normal disconnect/network drop where preference IS
+// preserved (so toggle restores when they reconnect within the grace period).
 export async function forceSetUnavailable(userId, io) {
   _cancelFcmPingCheck(userId);
   _cancelAvailabilityTimeout(userId);
@@ -459,9 +472,10 @@ export async function forceSetUnavailable(userId, io) {
       await db.collection('users').doc(userId).update({
         isAvailable: false,
         isOnline: false,
+        availabilityPreference: false,
         appTerminatedAt: new Date()
       });
-      logger.info(`User ${userId} - Force-close: isAvailable=false, isOnline=false`);
+      logger.info(`User ${userId} - Force-close: isAvailable=false, isOnline=false, availabilityPreference=false`);
 
       io.to('room_male_browse').emit('availability_changed', {
         femaleUserId: userId,
