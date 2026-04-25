@@ -25,14 +25,18 @@ export const FEMALE_EARNING_RATES = {
   video: 12.30 / 60   // ₹12.30 per minute after 50% split + 18% GST
 };
 
-// Coin packages — server-authoritative pricing (60% OFF offer)
+// Coin packages — server-authoritative pricing (8 packs total)
+// First 7 packs are also rotated daily as offer cards on male home screen.
+// Elite pack is store-only (not part of daily rotation).
 export const COIN_PACKAGES = {
-  'mini_pack':     { id: 'mini_pack',     name: 'Mini Pack',     coinAmount: 50,   priceInRupees: 50,   discountPercent: 60, isPopular: false, isActive: true },
-  'starter_pack':  { id: 'starter_pack',  name: 'Starter Pack',  coinAmount: 100,  priceInRupees: 100,  discountPercent: 60, isPopular: false, isActive: true },
-  'popular_pack':  { id: 'popular_pack',  name: 'Popular Pack',  coinAmount: 300,  priceInRupees: 300,  discountPercent: 60, isPopular: true,  isActive: true },
-  'value_pack':    { id: 'value_pack',    name: 'Value Pack',    coinAmount: 500,  priceInRupees: 500,  discountPercent: 60, isPopular: false, isActive: true },
-  'mega_pack':     { id: 'mega_pack',     name: 'Mega Pack',     coinAmount: 1000, priceInRupees: 1000, discountPercent: 60, isPopular: false, isActive: true },
-  'ultimate_pack': { id: 'ultimate_pack', name: 'Ultimate Pack', coinAmount: 1500, priceInRupees: 1500, discountPercent: 60, isPopular: false, isActive: true }
+  'starter_pack':  { id: 'starter_pack',  name: 'Starter Pack',  coinAmount: 30,   priceInRupees: 9,    isPopular: false, isActive: true },
+  'mini_boost':    { id: 'mini_boost',    name: 'Mini Boost',    coinAmount: 90,   priceInRupees: 29,   isPopular: false, isActive: true },
+  'value_pack':    { id: 'value_pack',    name: 'Value Pack',    coinAmount: 195,  priceInRupees: 59,   isPopular: false, isActive: true },
+  'saver_pack':    { id: 'saver_pack',    name: 'Saver Pack',    coinAmount: 330,  priceInRupees: 99,   isPopular: true,  isActive: true },
+  'power_pack':    { id: 'power_pack',    name: 'Power Pack',    coinAmount: 690,  priceInRupees: 199,  isPopular: false, isActive: true },
+  'mega_pack':     { id: 'mega_pack',     name: 'Mega Pack',     coinAmount: 1080, priceInRupees: 299,  isPopular: false, isActive: true },
+  'ultimate_pack': { id: 'ultimate_pack', name: 'Ultimate Pack', coinAmount: 1500, priceInRupees: 499,  isPopular: false, isActive: true },
+  'elite_pack':    { id: 'elite_pack',    name: 'Elite Pack',    coinAmount: 3000, priceInRupees: 999,  isPopular: false, isActive: true }
 };
 
 // Daily rewards
