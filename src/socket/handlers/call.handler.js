@@ -556,9 +556,10 @@ export function registerCallHandlers(io, socket) {
 
     // Stop server timer
     const serverTimer = getCallTimer(callId);
+    const isTrialCall = serverTimer?.isTrialCall === true;
     if (serverTimer) {
       clearInterval(serverTimer.interval);
-      logger.info(`Stopped server timer for call ${callId}: ${serverTimer.durationSeconds}s`);
+      logger.info(`Stopped server timer for call ${callId}: ${serverTimer.durationSeconds}s${isTrialCall ? ' [TRIAL]' : ''}`);
     }
 
     // Reset all participants
@@ -575,7 +576,9 @@ export function registerCallHandlers(io, socket) {
             callId,
             endedBy: userId,
             duration: call.endedAt - call.createdAt,
-            endedAt: call.endedAt.toISOString()
+            endedAt: call.endedAt.toISOString(),
+            isTrialCall,
+            displayLabel: isTrialCall ? 'Trial Call' : null,
           });
         }
 
