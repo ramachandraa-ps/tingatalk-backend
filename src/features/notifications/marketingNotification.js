@@ -8,7 +8,6 @@
 // ============================================================================
 
 import { getFirestore, admin } from '../../config/firebase.js';
-import { getAllConnectedUsers } from '../../socket/state/connectionManager.js';
 import { logger } from '../../utils/logger.js';
 
 // In-memory throttle state (resets on server restart — acceptable tradeoff)
@@ -24,26 +23,6 @@ let marketingJobId = null;
 // ============================================================================
 // Helpers
 // ============================================================================
-
-/**
- * Check if at least one male user is currently online (connected via socket).
- * Reads from in-memory connectionManager — no Firestore query needed.
- */
-function hasAtLeastOneMaleOnline() {
-  try {
-    const allUsers = getAllConnectedUsers();
-    for (const [, userData] of allUsers.entries()) {
-      if (!userData) continue;
-      if (userData.userType === 'male' && userData.isOnline === true) {
-        return true;
-      }
-    }
-    return false;
-  } catch (err) {
-    logger.error(`Marketing job: failed to check online males: ${err.message}`);
-    return false;
-  }
-}
 
 /**
  * Check if at least one female user has isAvailable=true in Firestore.
@@ -157,25 +136,25 @@ async function runMarketingCheck() {
   const now = Date.now();
   logger.info('Marketing notification check running...');
 
-  // ---- Direction 1: Notify FEMALES when male is online ----
+  // ---- Direction 1: Notify FEMALES (always, every 30 min — Option D) ----
+  // Asymmetry rationale: tracking active males in real-time is unreliable
+  // (in-memory socket state misses backgrounded males with FCM-reachability).
+  // The client opted for time-based marketing instead — fire every 30 min
+  // regardless of who is currently connected. Throttle still applies.
   try {
     if (now - lastMaleOnlineNotifSent >= THROTTLE_MS) {
-      if (hasAtLeastOneMaleOnline()) {
-        logger.info('Marketing: male(s) online — preparing notification to females');
-        const femaleTokens = await getFcmTokensForGender('female');
-        if (femaleTokens.length > 0) {
-          await sendMarketingNotification(
-            femaleTokens,
-            'TingaTalk',
-            'Users are active on TingaTalk! Go online to receive calls',
-            'marketing_male_online'
-          );
-          lastMaleOnlineNotifSent = now;
-        } else {
-          logger.info('Marketing: no female FCM tokens available');
-        }
+      logger.info('Marketing: time-based fire — preparing notification to females');
+      const femaleTokens = await getFcmTokensForGender('female');
+      if (femaleTokens.length > 0) {
+        await sendMarketingNotification(
+          femaleTokens,
+          'TingaTalk',
+          'Users are active on TingaTalk! Go online to receive calls',
+          'marketing_male_online'
+        );
+        lastMaleOnlineNotifSent = now;
       } else {
-        logger.info('Marketing: no males online — skipping notification to females');
+        logger.info('Marketing: no female FCM tokens available');
       }
     } else {
       const waitMin = Math.ceil((THROTTLE_MS - (now - lastMaleOnlineNotifSent)) / 60000);
