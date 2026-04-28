@@ -6,9 +6,6 @@ import { FEMALE_EARNING_RATES } from '../shared/constants.js';
  * Update callLogs subcollection for both caller and recipient when a call completes.
  * This ensures the frontend call history screen shows accurate data regardless of
  * how the call ended (normal, disconnect, or stale heartbeat).
- *
- * For trial calls (isTrialCall=true): coinsDeducted=0 and earnings=0,
- * with displayLabel='Trial Call' so frontend can show "Trial Call" instead of amount.
  */
 export async function updateCallLogs({
   callId,
@@ -20,8 +17,6 @@ export async function updateCallLogs({
   status = 'completed',
   endReason = 'completed',
   source = 'server',
-  isTrialCall = false,
-  displayLabel = null,
 }) {
   try {
     const db = getFirestore();
@@ -29,8 +24,7 @@ export async function updateCallLogs({
 
     const now = admin.firestore.FieldValue.serverTimestamp();
     const earningRate = callType === 'video' ? FEMALE_EARNING_RATES.video : FEMALE_EARNING_RATES.audio;
-    // For trial calls: zero earnings regardless of duration
-    const earnings = isTrialCall ? 0 : parseFloat((durationSeconds * earningRate).toFixed(2));
+    const earnings = parseFloat((durationSeconds * earningRate).toFixed(2));
 
     const updateData = {
       status,
@@ -40,8 +34,6 @@ export async function updateCallLogs({
       callEndedAt: now,
       completedAt: now,
       updatedAt: now,
-      isTrialCall,
-      displayLabel: displayLabel || (isTrialCall ? 'Trial Call' : null),
     };
 
     const writes = [];
@@ -52,7 +44,7 @@ export async function updateCallLogs({
         db.collection('users').doc(callerId).collection('callLogs').doc(callId)
           .set({
             ...updateData,
-            coinsDeducted: isTrialCall ? 0 : (coinsDeducted || 0),
+            coinsDeducted: coinsDeducted || 0,
           }, { merge: true })
       );
     }
@@ -69,7 +61,7 @@ export async function updateCallLogs({
     }
 
     await Promise.all(writes);
-    logger.info(`Call logs updated for ${callId} (${source})${isTrialCall ? ' [TRIAL]' : ''}: caller=${callerId}, recipient=${recipientId}`);
+    logger.info(`Call logs updated for ${callId} (${source}): caller=${callerId}, recipient=${recipientId}`);
   } catch (err) {
     logger.error(`Failed to update call logs for ${callId}: ${err.message}`);
   }
