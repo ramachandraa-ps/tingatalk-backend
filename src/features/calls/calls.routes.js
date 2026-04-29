@@ -13,6 +13,7 @@ import {
   FEMALE_EARNING_RATES, ENDED_CALL_STATUSES
 } from '../../shared/constants.js';
 import { updateCallLogs } from '../../utils/callLogUtil.js';
+import { performCallBilling } from '../../utils/callBillingUtil.js';
 
 const router = Router();
 
@@ -168,21 +169,14 @@ router.post('/start', async (req, res) => {
       if (usedInCall >= timer.initialBalance) {
         logger.warn(`AUTO-END: ${callId} - caller ${timer.callerId} initial balance ${timer.initialBalance} exhausted at ${timer.durationSeconds}s (used: ${usedInCall.toFixed(2)})`);
         clearInterval(timer.interval);
-        const callerConn = getConnectedUser(timer.callerId);
-        const recipientConn = getConnectedUser(timer.recipientId);
-        const endPayload = { callId, endedBy: 'server', reason: 'insufficient_balance', duration: timer.durationSeconds };
-        if (ioApp && callerConn) ioApp.to(callerConn.socketId).emit('call_ended', endPayload);
-        if (ioApp && recipientConn) ioApp.to(recipientConn.socketId).emit('call_ended', endPayload);
-        try {
-          await db.collection('calls').doc(callId).update({
-            status: 'ended',
-            durationSeconds: timer.durationSeconds,
-            endedAt: admin.firestore.FieldValue.serverTimestamp(),
-            endReason: 'insufficient_balance'
-          });
-        } catch (e) {
-          logger.warn(`Auto-end Firestore update failed for ${callId}: ${e.message}`);
-        }
+        // Run the same billing pipeline as /api/calls/complete so coins
+        // are deducted and female earnings are credited (not just notify+kill).
+        await performCallBilling({
+          callId, timer,
+          endReason: 'insufficient_balance',
+          source: 'server_auto_end',
+          db, io: ioApp,
+        });
         setUserStatus(timer.callerId, { status: 'available', currentCallId: null, lastStatusChange: new Date() });
         setUserStatus(timer.recipientId, { status: 'available', currentCallId: null, lastStatusChange: new Date() });
         deleteCallTimer(callId);
@@ -301,23 +295,29 @@ router.post('/complete', async (req, res) => {
 
     logger.info(`Completing call: ${finalCallId}`);
 
-    // Idempotency: only skip if SERVER already billed this call
-    // (billingSource === 'server' means coins were already deducted)
+    // Idempotency: skip re-billing if SERVER already billed this call.
+    // billingSource is set to 'server' (manual end via this endpoint) or
+    // 'server_auto_end' (mid-call auto-end via the billing timer).
     const db = getFirestore();
     if (db) {
       try {
         const existingCall = await db.collection('calls').doc(finalCallId).get();
         if (existingCall.exists) {
           const existing = existingCall.data();
-          if (existing.status === 'completed' && existing.billingSource === 'server') {
-            logger.info(`Call ${finalCallId} already billed by server — returning cached result`);
+          const alreadyBilled = existing.status === 'completed' &&
+            (existing.billingSource === 'server' || existing.billingSource === 'server_auto_end');
+          if (alreadyBilled) {
+            logger.info(`Call ${finalCallId} already billed (source: ${existing.billingSource}) — returning cached result`);
             return res.json({
               success: true, callId: finalCallId,
               durationSeconds: existing.durationSeconds || 0,
               coinsDeducted: existing.coinsDeducted || 0,
-              newBalance: null, source: 'already_completed',
+              newBalance: null,
+              source: existing.billingSource === 'server_auto_end' ? 'server_auto_end' : 'already_completed',
               duplicate: true,
-              message: 'Call was already completed and billed'
+              message: existing.billingSource === 'server_auto_end'
+                ? 'Call ended by server (insufficient balance) and was already billed'
+                : 'Call was already completed and billed'
             });
           }
         }

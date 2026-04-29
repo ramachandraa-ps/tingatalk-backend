@@ -9,6 +9,7 @@ import {
   completeCall
 } from '../state/connectionManager.js';
 import { COIN_RATES, CALL_RING_TIMEOUT_MS, FCM_CALL_TIMEOUT_MS } from '../../shared/constants.js';
+import { performCallBilling } from '../../utils/callBillingUtil.js';
 
 // FCM notification helper
 async function sendIncomingCallNotification(userId, callData) {
@@ -405,21 +406,13 @@ export function registerCallHandlers(io, socket) {
           clearInterval(timer.interval);
           const callObj = getActiveCall(callId);
           if (callObj) callObj.status = 'completed';
-          const callerConn = getConnectedUser(timer.callerId);
-          const recipientConn = getConnectedUser(timer.recipientId);
-          const endPayload = { callId, endedBy: 'server', reason: 'insufficient_balance', duration: timer.durationSeconds };
-          if (callerConn) io.to(callerConn.socketId).emit('call_ended', endPayload);
-          if (recipientConn) io.to(recipientConn.socketId).emit('call_ended', endPayload);
-          try {
-            await db.collection('calls').doc(callId).update({
-              status: 'ended',
-              durationSeconds: timer.durationSeconds,
-              endedAt: admin.firestore.FieldValue.serverTimestamp(),
-              endReason: 'insufficient_balance'
-            });
-          } catch (e) {
-            logger.warn(`Auto-end Firestore update failed for ${callId}: ${e.message}`);
-          }
+          // Run full billing pipeline (deduct male coins, credit female, log txns)
+          await performCallBilling({
+            callId, timer,
+            endReason: 'insufficient_balance',
+            source: 'server_auto_end',
+            db, io,
+          });
           setUserStatus(timer.callerId, { status: 'available', currentCallId: null, lastStatusChange: new Date() });
           setUserStatus(timer.recipientId, { status: 'available', currentCallId: null, lastStatusChange: new Date() });
           deleteCallTimer(callId);
