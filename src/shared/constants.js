@@ -9,11 +9,11 @@ export const COIN_RATES = {
   video: 90 / 60   // 90 coins per minute (1.5 coins/sec)
 };
 
-// Minimum call requirements (2 minute minimum)
-export const MIN_CALL_DURATION_SECONDS = 120;
+// Minimum call requirements (1 minute minimum)
+export const MIN_CALL_DURATION_SECONDS = 60;
 export const MIN_BALANCE = {
-  audio: Math.ceil(COIN_RATES.audio * MIN_CALL_DURATION_SECONDS),  // 20 coins
-  video: Math.ceil(COIN_RATES.video * MIN_CALL_DURATION_SECONDS)   // 60 coins
+  audio: Math.ceil(COIN_RATES.audio * MIN_CALL_DURATION_SECONDS),  // 30 coins (0.5 * 60)
+  video: Math.ceil(COIN_RATES.video * MIN_CALL_DURATION_SECONDS)   // 90 coins (1.5 * 60)
 };
 
 // Female earning rates (INR per second)
