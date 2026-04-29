@@ -148,46 +148,51 @@ router.post('/start', async (req, res) => {
     };
     await db.collection('calls').doc(callId).set(callData, { merge: true });
 
-    // Start timer with mid-call balance check (Fix 6)
+    // Start timer with precise per-second balance check.
+    //
+    // Old logic compared Firestore balance vs projected need every 30s — but
+    // Firestore is only decremented at call END (in /api/calls/complete), so
+    // for a user starting with exactly MIN_BALANCE coins the check never
+    // triggered (balance stayed equal to projected need throughout the call).
+    //
+    // New logic: snapshot the initial balance into the timer, then each
+    // second compute coins-already-used and end exactly when used >= initial.
+    // For 30 coins at 0.5/sec → ends at second 60 precisely.
     const ioApp = req.app.get('io');
     const interval = setInterval(async () => {
       const timer = getCallTimer(callId);
       if (!timer) return;
       timer.durationSeconds++;
 
-      // Mid-call balance check every 30s
-      if (timer.durationSeconds % 30 === 0) {
+      const usedInCall = timer.durationSeconds * timer.coinRate;
+      if (usedInCall >= timer.initialBalance) {
+        logger.warn(`AUTO-END: ${callId} - caller ${timer.callerId} initial balance ${timer.initialBalance} exhausted at ${timer.durationSeconds}s (used: ${usedInCall.toFixed(2)})`);
+        clearInterval(timer.interval);
+        const callerConn = getConnectedUser(timer.callerId);
+        const recipientConn = getConnectedUser(timer.recipientId);
+        const endPayload = { callId, endedBy: 'server', reason: 'insufficient_balance', duration: timer.durationSeconds };
+        if (ioApp && callerConn) ioApp.to(callerConn.socketId).emit('call_ended', endPayload);
+        if (ioApp && recipientConn) ioApp.to(recipientConn.socketId).emit('call_ended', endPayload);
         try {
-          const userDoc = await db.collection('users').doc(timer.callerId).get();
-          const balance = userDoc.exists ? (userDoc.data().coins ?? 0) : 0;
-          const projectedNeed = Math.ceil(60 * timer.coinRate);
-          if (balance < projectedNeed) {
-            logger.warn(`AUTO-END: Caller ${timer.callerId} balance (${balance}) below 1-min buffer (${projectedNeed}) for call ${callId}`);
-            clearInterval(timer.interval);
-            const callerConn = getConnectedUser(timer.callerId);
-            const recipientConn = getConnectedUser(timer.recipientId);
-            const endPayload = { callId, endedBy: 'server', reason: 'insufficient_balance', duration: timer.durationSeconds };
-            if (ioApp && callerConn) ioApp.to(callerConn.socketId).emit('call_ended', endPayload);
-            if (ioApp && recipientConn) ioApp.to(recipientConn.socketId).emit('call_ended', endPayload);
-            await db.collection('calls').doc(callId).update({
-              status: 'ended',
-              durationSeconds: timer.durationSeconds,
-              endedAt: admin.firestore.FieldValue.serverTimestamp(),
-              endReason: 'insufficient_balance'
-            }).catch(() => {});
-            setUserStatus(timer.callerId, { status: 'available', currentCallId: null, lastStatusChange: new Date() });
-            setUserStatus(timer.recipientId, { status: 'available', currentCallId: null, lastStatusChange: new Date() });
-            deleteCallTimer(callId);
-          }
+          await db.collection('calls').doc(callId).update({
+            status: 'ended',
+            durationSeconds: timer.durationSeconds,
+            endedAt: admin.firestore.FieldValue.serverTimestamp(),
+            endReason: 'insufficient_balance'
+          });
         } catch (e) {
-          logger.warn(`Mid-call balance check failed for ${callId}: ${e.message}`);
+          logger.warn(`Auto-end Firestore update failed for ${callId}: ${e.message}`);
         }
+        setUserStatus(timer.callerId, { status: 'available', currentCallId: null, lastStatusChange: new Date() });
+        setUserStatus(timer.recipientId, { status: 'available', currentCallId: null, lastStatusChange: new Date() });
+        deleteCallTimer(callId);
       }
     }, 1000);
 
     setCallTimer(callId, {
       interval, durationSeconds: 0, coinRate, callerId, recipientId,
-      callType, callerName, startTime, lastHeartbeat: Date.now()
+      callType, callerName, startTime, lastHeartbeat: Date.now(),
+      initialBalance: callerBalance,
     });
 
     res.json({

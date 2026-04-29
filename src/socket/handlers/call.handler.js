@@ -372,55 +372,57 @@ export function registerCallHandlers(io, socket) {
     call.participants.push(recipientId);
     call.acceptedAt = new Date();
 
-    // Auto-start billing timer if not already started
+    // Auto-start billing timer if not already started.
+    // Normally /api/calls/start has already created the timer, so this branch
+    // is skipped. It only runs if accept_call arrives before /api/calls/start
+    // (e.g., very fast female accept + slow male HTTP).
     if (!getCallTimer(callId)) {
       const coinRate = call.callType === 'video' ? COIN_RATES.video : COIN_RATES.audio;
       const startTime = Date.now();
 
+      // Fetch caller's balance once at timer start so we can enforce a precise
+      // per-second auto-end without re-querying Firestore every tick.
+      const db = getFirestore();
+      let initialBalance = 0;
+      if (db && callerId) {
+        try {
+          const userDoc = await db.collection('users').doc(callerId).get();
+          initialBalance = userDoc.exists ? (userDoc.data().coins ?? 0) : 0;
+        } catch (e) {
+          logger.warn(`accept_call: failed to read caller balance for ${callId}: ${e.message}`);
+        }
+      }
+
       const interval = setInterval(async () => {
         const timer = getCallTimer(callId);
-        if (timer) {
-          timer.durationSeconds++;
+        if (!timer) return;
+        timer.durationSeconds++;
 
-          // Fix 6: Mid-call balance check every 30s — auto-end if caller runs out
-          if (timer.durationSeconds % 30 === 0) {
-            logger.info(`Call ${callId} duration: ${timer.durationSeconds}s (auto-started on accept)`);
-            try {
-              const db = getFirestore();
-              if (db && timer.callerId) {
-                const userDoc = await db.collection('users').doc(timer.callerId).get();
-                const balance = userDoc.exists ? (userDoc.data().coins ?? 0) : 0;
-                const projectedNeed = Math.ceil(60 * timer.coinRate); // 1 min buffer
-                if (balance < projectedNeed) {
-                  logger.warn(`AUTO-END: Caller ${timer.callerId} balance (${balance}) below 1-min buffer (${projectedNeed}) for call ${callId}`);
-                  clearInterval(timer.interval);
-                  // Mark call as ended due to insufficient balance
-                  const callObj = getActiveCall(callId);
-                  if (callObj) callObj.status = 'completed';
-                  // Notify both users
-                  const callerConn = getConnectedUser(timer.callerId);
-                  const recipientConn = getConnectedUser(timer.recipientId);
-                  const endPayload = { callId, endedBy: 'server', reason: 'insufficient_balance', duration: timer.durationSeconds };
-                  if (callerConn) io.to(callerConn.socketId).emit('call_ended', endPayload);
-                  if (recipientConn) io.to(recipientConn.socketId).emit('call_ended', endPayload);
-                  // Mark in Firestore
-                  await db.collection('calls').doc(callId).update({
-                    status: 'ended',
-                    durationSeconds: timer.durationSeconds,
-                    endedAt: admin.firestore.FieldValue.serverTimestamp(),
-                    endReason: 'insufficient_balance'
-                  }).catch(() => {});
-                  // Reset statuses
-                  setUserStatus(timer.callerId, { status: 'available', currentCallId: null, lastStatusChange: new Date() });
-                  setUserStatus(timer.recipientId, { status: 'available', currentCallId: null, lastStatusChange: new Date() });
-                  deleteCallTimer(callId);
-                  return;
-                }
-              }
-            } catch (balanceErr) {
-              logger.warn(`Mid-call balance check failed for ${callId}: ${balanceErr.message}`);
-            }
+        // Precise per-second balance check — end exactly when initial coins exhausted
+        const usedInCall = timer.durationSeconds * timer.coinRate;
+        if (usedInCall >= timer.initialBalance) {
+          logger.warn(`AUTO-END: ${callId} - caller ${timer.callerId} initial balance ${timer.initialBalance} exhausted at ${timer.durationSeconds}s (used: ${usedInCall.toFixed(2)})`);
+          clearInterval(timer.interval);
+          const callObj = getActiveCall(callId);
+          if (callObj) callObj.status = 'completed';
+          const callerConn = getConnectedUser(timer.callerId);
+          const recipientConn = getConnectedUser(timer.recipientId);
+          const endPayload = { callId, endedBy: 'server', reason: 'insufficient_balance', duration: timer.durationSeconds };
+          if (callerConn) io.to(callerConn.socketId).emit('call_ended', endPayload);
+          if (recipientConn) io.to(recipientConn.socketId).emit('call_ended', endPayload);
+          try {
+            await db.collection('calls').doc(callId).update({
+              status: 'ended',
+              durationSeconds: timer.durationSeconds,
+              endedAt: admin.firestore.FieldValue.serverTimestamp(),
+              endReason: 'insufficient_balance'
+            });
+          } catch (e) {
+            logger.warn(`Auto-end Firestore update failed for ${callId}: ${e.message}`);
           }
+          setUserStatus(timer.callerId, { status: 'available', currentCallId: null, lastStatusChange: new Date() });
+          setUserStatus(timer.recipientId, { status: 'available', currentCallId: null, lastStatusChange: new Date() });
+          deleteCallTimer(callId);
         }
       }, 1000);
 
@@ -433,7 +435,8 @@ export function registerCallHandlers(io, socket) {
         callType: call.callType,
         startTime,
         lastHeartbeat: Date.now(),
-        autoStarted: true
+        autoStarted: true,
+        initialBalance,
       });
 
       logger.info(`Auto-started billing timer for call ${callId} (${call.callType}) - Rate: ${coinRate}/s`);
