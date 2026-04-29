@@ -3,10 +3,10 @@
 // ============================================================================
 
 // Coin rates (server-side source of truth) — 1 coin = ₹1
-// Video: 30 coins/min = 0.5 coins/sec | Audio: 10 coins/min ≈ 0.1667 coins/sec
+// Video: 90 coins/min = 1.5 coins/sec | Audio: 30 coins/min = 0.5 coins/sec
 export const COIN_RATES = {
-  audio: 10 / 60,  // 10 coins per minute
-  video: 30 / 60   // 30 coins per minute (0.5 coins/sec)
+  audio: 30 / 60,  // 30 coins per minute (0.5 coins/sec)
+  video: 90 / 60   // 90 coins per minute (1.5 coins/sec)
 };
 
 // Minimum call requirements (2 minute minimum)
