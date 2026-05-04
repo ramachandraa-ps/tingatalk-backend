@@ -380,6 +380,9 @@ router.get('/get_available_females', async (req, res) => {
       if (userData.isAvailable !== true) continue;
 
       // Check reachability: socket OR FCM token
+      // Why: female may briefly drop socket (backgrounded app, transient network)
+      // but stay reachable via FCM. Tier 1/1.5 system preserves isAvailable=true
+      // during these gaps — the browse list must honor that to avoid stale UI.
       const userConnection = getConnectedUser(userId);
       const hasActiveConnection = userConnection && userConnection.isOnline;
 
@@ -389,9 +392,11 @@ router.get('/get_available_females', async (req, res) => {
         isSocketConnected = userSocket && userSocket.connected;
       }
 
-      // Must have active socket connection to appear in browse
-      // FCM token alone is not enough — female must be actively connected
-      if (!isSocketConnected) continue;
+      const hasFcmToken = !!(userData.fcmToken && typeof userData.fcmToken === 'string' && userData.fcmToken.length > 0);
+      const isReachable = isSocketConnected || hasFcmToken;
+
+      // Skip only if she's neither socket-connected nor FCM-reachable
+      if (!isReachable) continue;
 
       // Determine status (available or busy)
       const userStatusData = getUserStatus(userId);
@@ -435,6 +440,7 @@ router.get('/get_available_females', async (req, res) => {
         isOnline: isSocketConnected,
         isAvailable: true,
         connectionType: isSocketConnected ? 'socket' : 'fcm',
+        reachability: isSocketConnected ? 'websocket' : 'fcm_only',
         status, // 'available' or 'busy'
         currentCallId,
         rating: powerUpStats.rating,

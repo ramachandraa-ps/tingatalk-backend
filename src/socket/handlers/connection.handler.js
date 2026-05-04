@@ -187,6 +187,16 @@ export function registerConnectionHandlers(io, socket) {
     });
 
     logger.info(`User ${userId} (${userType || 'unknown'}) joined - Socket: ${socket.id}`);
+
+    // Push availability snapshot so male UI converges immediately on (re)connect.
+    // Why: real-time `availability_changed` events are not replayed; if the male
+    // missed events while paused, his cards stay stale until the next event.
+    // The snapshot is the ground-truth fallback that makes the UI self-healing.
+    if (userType === 'male') {
+      sendAvailabilitySnapshot(io, socket, userId).catch(err => {
+        logger.warn(`availability_snapshot failed for ${userId}: ${err.message}`);
+      });
+    }
   });
 
   socket.on('disconnect', async (reason) => {
@@ -398,4 +408,55 @@ export function registerConnectionHandlers(io, socket) {
       break;
     }
   });
+}
+
+/**
+ * Push current available-female state to a male socket on (re)connect.
+ * Mirrors the filter logic of GET /api/get_available_females so the
+ * push-based real-time stream can self-heal after missed events.
+ */
+async function sendAvailabilitySnapshot(io, socket, maleUserId) {
+  const db = getFirestore();
+  if (!db) return;
+
+  const femalesSnapshot = await db.collection('users')
+    .where('gender', '==', 'female')
+    .where('isVerified', '==', true)
+    .where('isAvailable', '==', true)
+    .get();
+
+  const females = [];
+  for (const doc of femalesSnapshot.docs) {
+    const userData = doc.data();
+    const userId = doc.id;
+    if (userData.isAvailable !== true) continue;
+
+    const userConnection = getConnectedUser(userId);
+    const hasActiveConnection = userConnection && userConnection.isOnline;
+    let isSocketConnected = false;
+    if (hasActiveConnection) {
+      const userSocket = io.sockets.sockets.get(userConnection.socketId);
+      isSocketConnected = userSocket && userSocket.connected;
+    }
+    const hasFcmToken = !!(userData.fcmToken && typeof userData.fcmToken === 'string' && userData.fcmToken.length > 0);
+    if (!isSocketConnected && !hasFcmToken) continue;
+
+    const userStatusData = getUserStatus(userId);
+    const isBusy = userStatusData && userStatusData.status === 'busy';
+
+    females.push({
+      femaleUserId: userId,
+      isAvailable: true,
+      isOnline: isSocketConnected,
+      reachability: isSocketConnected ? 'websocket' : 'fcm_only',
+      status: isBusy ? 'busy' : 'available'
+    });
+  }
+
+  socket.emit('availability_snapshot', {
+    females,
+    count: females.length,
+    timestamp: new Date().toISOString()
+  });
+  logger.info(`Sent availability_snapshot to male ${maleUserId}: ${females.length} available females`);
 }
