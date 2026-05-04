@@ -8,8 +8,15 @@ import {
   startDisconnectTimeout, cancelDisconnectTimeout,
   completeCall, setCallTimer,
   forceSetUnavailable,
-  confirmBackgrounded
+  confirmBackgrounded,
+  wasRecentlyBroadcastOffline, clearRecentOfflineBroadcast
 } from '../state/connectionManager.js';
+
+// In-memory dedup for rapid duplicate join requests from buggy frontends.
+// When the Flutter app fires 8 join events in 1ms (multiple lifecycle observers
+// + WebSocketService races), we process the first and silently ack the rest.
+const recentJoinsByUser = new Map(); // userId -> timestamp
+const JOIN_DEDUP_WINDOW_MS = 1000;
 import { COIN_RATES, FEMALE_EARNING_RATES } from '../../shared/constants.js';
 import { updateCallLogs } from '../../utils/callLogUtil.js';
 
@@ -50,6 +57,29 @@ export function registerConnectionHandlers(io, socket) {
       socket.emit('error', { message: 'User ID is required' });
       return;
     }
+
+    // Dedup rapid duplicate joins from same user within 1s.
+    // Why: Flutter app's lifecycle observers race and emit join 6-8 times per resume,
+    // each one cascading into Firestore writes + male broadcasts. First one wins,
+    // duplicates get a clean ack but skip the rest of the work.
+    const lastJoinTs = recentJoinsByUser.get(userId);
+    const nowMs = Date.now();
+    if (lastJoinTs && (nowMs - lastJoinTs) < JOIN_DEDUP_WINDOW_MS) {
+      socket.emit('joined', {
+        userId,
+        userType: userType || 'unknown',
+        socketId: socket.id,
+        roomName: `user_${userId}`,
+        success: true,
+        deduped: true,
+      });
+      // Still ensure THIS socket joins the user-specific room (each socket needs it
+      // for direct events even though backend state was already updated by the first join)
+      socket.join(`user_${userId}`);
+      if (userType === 'male') socket.join('room_male_browse');
+      return;
+    }
+    recentJoinsByUser.set(userId, nowMs);
 
     logger.info(`Processing join for user: ${userId}`);
 
@@ -175,6 +205,23 @@ export function registerConnectionHandlers(io, socket) {
         reason: 'user_connected',
         timestamp: new Date().toISOString()
       });
+
+      // Recovery event — fires only if we ACTUALLY sent an offline broadcast
+      // for this female recently. The bypassDedup flag tells the male frontend
+      // to skip its timestamp-based dedup so this auto-recovery is not dropped
+      // alongside the older offline event.
+      if (userType === 'female' && wasRecentlyBroadcastOffline(userId)) {
+        io.to('room_male_browse').emit('availability_recovered', {
+          femaleUserId: userId,
+          isAvailable: true,
+          isOnline: true,
+          reason: 'female_reconnected_after_offline_broadcast',
+          bypassDedup: true,
+          timestamp: new Date().toISOString()
+        });
+        clearRecentOfflineBroadcast(userId);
+        logger.info(`Sent availability_recovered for ${userId} (auto-corrects male UIs)`);
+      }
     }
 
     socket.emit('joined', {

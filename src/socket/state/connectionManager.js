@@ -13,6 +13,13 @@ const disconnectTimeouts = new Map();
 const availabilityTimeouts = new Map();
 const fcmPingTimeouts = new Map();         // Tier 1.5: FCM ping response tracking
 const confirmedBackgrounded = new Set();   // Users who responded to FCM ping (confirmed alive)
+const offlineBroadcastTimeouts = new Map(); // Grace-window timers before notifying males of female offline
+const recentOfflineBroadcasts = new Map();  // userId -> timestamp of last actual offline broadcast (for recovery event)
+
+// Grace period after Tier 1 fires before we actually tell males "she's offline".
+// Prevents card flicker during normal mobile network jitter (8-30s drops).
+// If she reconnects within this window, no males ever see the offline event.
+const OFFLINE_BROADCAST_GRACE_MS = 30000;
 
 // --- Connected Users ---
 export function setConnectedUser(userId, userData) {
@@ -194,13 +201,12 @@ export function startDisconnectTimeout(userId, userType, io) {
           });
           logger.info(`Female user ${userId} - Tier 1: isOnline=false (isAvailable preserved, FCM-reachable)`);
 
-          io.to('room_male_browse').emit('availability_changed', {
-            femaleUserId: userId,
-            isAvailable: true,
-            isOnline: false,
-            reason: 'disconnect_timeout',
-            timestamp: new Date().toISOString()
-          });
+          // Defer the male-facing broadcast by OFFLINE_BROADCAST_GRACE_MS.
+          // Why: female sockets routinely flap for 8-30s on mobile networks (Android doze,
+          // network handoffs, app backgrounding). Broadcasting "she's offline" immediately
+          // causes male card flicker / removal. If she reconnects within the grace window,
+          // we cancel the broadcast — males never see her go offline at all.
+          _scheduleOfflineBroadcast(userId, io);
 
           // Start Tier 1.5: Send FCM ping to detect force-close vs background
           _startFcmPingCheck(userId, io);
@@ -242,6 +248,59 @@ export function cancelDisconnectTimeout(userId) {
   }
   _cancelFcmPingCheck(userId);
   _cancelAvailabilityTimeout(userId);
+  _cancelOfflineBroadcast(userId);
+}
+
+// Schedule a deferred "she went offline" broadcast to males (Tier 1 grace window).
+// If user reconnects before this fires, _cancelOfflineBroadcast() short-circuits it.
+function _scheduleOfflineBroadcast(userId, io) {
+  _cancelOfflineBroadcast(userId);
+  const timeoutId = setTimeout(() => {
+    // Re-check connection state before broadcasting — they may have come back
+    const conn = connectedUsers.get(userId);
+    if (conn && conn.isOnline) {
+      logger.info(`Suppressing offline broadcast for ${userId} — already reconnected`);
+      offlineBroadcastTimeouts.delete(userId);
+      return;
+    }
+    io.to('room_male_browse').emit('availability_changed', {
+      femaleUserId: userId,
+      isAvailable: true,
+      isOnline: false,
+      reason: 'disconnect_timeout',
+      timestamp: new Date().toISOString()
+    });
+    recentOfflineBroadcasts.set(userId, Date.now());
+    logger.info(`Tier 1 offline broadcast SENT for ${userId} (after ${OFFLINE_BROADCAST_GRACE_MS / 1000}s grace)`);
+    offlineBroadcastTimeouts.delete(userId);
+  }, OFFLINE_BROADCAST_GRACE_MS);
+  offlineBroadcastTimeouts.set(userId, timeoutId);
+  logger.info(`Tier 1 offline broadcast DEFERRED for ${userId} (${OFFLINE_BROADCAST_GRACE_MS / 1000}s grace window)`);
+}
+
+function _cancelOfflineBroadcast(userId) {
+  const timeoutId = offlineBroadcastTimeouts.get(userId);
+  if (timeoutId) {
+    clearTimeout(timeoutId);
+    offlineBroadcastTimeouts.delete(userId);
+    logger.info(`Tier 1 offline broadcast CANCELLED for ${userId} (reconnect within grace window)`);
+  }
+}
+
+// Returns true if an offline broadcast was actually sent recently (within last 60s)
+// Used by join handler to decide if a recovery event is needed for male UIs
+export function wasRecentlyBroadcastOffline(userId) {
+  const ts = recentOfflineBroadcasts.get(userId);
+  if (!ts) return false;
+  if (Date.now() - ts > 60000) {
+    recentOfflineBroadcasts.delete(userId);
+    return false;
+  }
+  return true;
+}
+
+export function clearRecentOfflineBroadcast(userId) {
+  recentOfflineBroadcasts.delete(userId);
 }
 
 // --- Tier 1.5: Double FCM Ping to detect force-close vs background ---
