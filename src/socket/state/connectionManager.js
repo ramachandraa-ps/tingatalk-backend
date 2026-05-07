@@ -174,7 +174,11 @@ export function getAllCallTimers() {
 }
 
 // --- Disconnect Timeouts ---
-export function startDisconnectTimeout(userId, userType, io) {
+// onConfirmedDisconnect: optional async callback fired after the 15s grace
+// window expires WITHOUT a reconnect. Used by the disconnect handler to defer
+// active-call termination — the cleanup runs here only when we're sure the
+// user is truly gone, not just briefly flapping.
+export function startDisconnectTimeout(userId, userType, io, onConfirmedDisconnect = null) {
   cancelDisconnectTimeout(userId);
 
   logger.info(`Starting disconnect timeout for ${userId} (${userType || 'unknown'}) - ${DISCONNECT_TIMEOUT_MS / 1000}s`);
@@ -184,7 +188,19 @@ export function startDisconnectTimeout(userId, userType, io) {
     if (userConnection && userConnection.isOnline) {
       logger.info(`User ${userId} has reconnected - NOT marking as unavailable`);
       disconnectTimeouts.delete(userId);
+      // Skip any deferred call cleanup — they're back, call should continue
       return;
+    }
+
+    // Confirmed offline. Run any deferred call-termination cleanup BEFORE
+    // touching Firestore status, so billing / earnings / call logs flush
+    // while userStatus still has currentCallId.
+    if (onConfirmedDisconnect) {
+      try {
+        await onConfirmedDisconnect();
+      } catch (cbErr) {
+        logger.error(`onConfirmedDisconnect callback failed for ${userId}: ${cbErr.message}`);
+      }
     }
 
     try {

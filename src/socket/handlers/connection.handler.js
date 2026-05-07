@@ -133,34 +133,63 @@ export function registerConnectionHandlers(io, socket) {
     // Set user status from Firestore preference
     // Read availabilityPreference (user's toggle choice) — NOT isAvailable (system-managed)
     const currentStatus = getUserStatus(userId);
-    if (!currentStatus || currentStatus.status === 'unavailable' || currentStatus.status === 'disconnected') {
-      let savedPreference = true;
-      try {
-        const db = getFirestore();
-        if (db) {
-          const userDoc = await db.collection('users').doc(userId).get();
-          if (userDoc.exists) {
-            const userData = userDoc.data();
-            // Use availabilityPreference (user's toggle) — fallback to isAvailable for old users
-            savedPreference = userData.availabilityPreference !== undefined
-              ? userData.availabilityPreference !== false
-              : userData.isAvailable !== false;
-            logger.info(`Loaded availability preference for ${userId}: ${savedPreference} (from ${userData.availabilityPreference !== undefined ? 'availabilityPreference' : 'isAvailable'})`);
-          }
-        }
-      } catch (err) {
-        logger.warn(`Could not load availability preference: ${err.message}`);
-      }
 
-      setUserStatus(userId, {
-        status: savedPreference ? 'available' : 'unavailable',
-        currentCallId: null,
-        lastStatusChange: new Date(),
-        userPreference: savedPreference
-      });
-      logger.info(`User ${userId} status set to: ${savedPreference ? 'available' : 'unavailable'}`);
-    } else {
-      logger.info(`User ${userId} status remains: ${currentStatus.status}`);
+    // BUSY-STATE RECOVERY: defense in depth against the disconnect-handler bug
+    // where a transient socket flap could wipe userStatus mid-call. Before
+    // resetting status from Firestore preference, check if there's still an
+    // active call where this user is a participant. If yes, restore busy
+    // state — Twilio is still connected on this user's device, and the call
+    // shouldn't be considered ended just because the websocket flapped.
+    let restoredFromActiveCall = false;
+    const activeCalls = getAllActiveCalls();
+    for (const [activeCallId, activeCall] of activeCalls.entries()) {
+      if (activeCall.status === 'completed') continue;
+      const isParticipant = activeCall.callerId === userId ||
+                            activeCall.recipientId === userId ||
+                            (Array.isArray(activeCall.participants) && activeCall.participants.includes(userId));
+      if (isParticipant) {
+        setUserStatus(userId, {
+          status: 'busy',
+          currentCallId: activeCallId,
+          lastStatusChange: new Date(),
+          userPreference: currentStatus ? currentStatus.userPreference : true
+        });
+        logger.info(`User ${userId} reconnected mid-call ${activeCallId} — restoring status=busy (BUSY-STATE RECOVERY)`);
+        restoredFromActiveCall = true;
+        break;
+      }
+    }
+
+    if (!restoredFromActiveCall) {
+      if (!currentStatus || currentStatus.status === 'unavailable' || currentStatus.status === 'disconnected') {
+        let savedPreference = true;
+        try {
+          const db = getFirestore();
+          if (db) {
+            const userDoc = await db.collection('users').doc(userId).get();
+            if (userDoc.exists) {
+              const userData = userDoc.data();
+              // Use availabilityPreference (user's toggle) — fallback to isAvailable for old users
+              savedPreference = userData.availabilityPreference !== undefined
+                ? userData.availabilityPreference !== false
+                : userData.isAvailable !== false;
+              logger.info(`Loaded availability preference for ${userId}: ${savedPreference} (from ${userData.availabilityPreference !== undefined ? 'availabilityPreference' : 'isAvailable'})`);
+            }
+          }
+        } catch (err) {
+          logger.warn(`Could not load availability preference: ${err.message}`);
+        }
+
+        setUserStatus(userId, {
+          status: savedPreference ? 'available' : 'unavailable',
+          currentCallId: null,
+          lastStatusChange: new Date(),
+          userPreference: savedPreference
+        });
+        logger.info(`User ${userId} status set to: ${savedPreference ? 'available' : 'unavailable'}`);
+      } else {
+        logger.info(`User ${userId} status remains: ${currentStatus.status}`);
+      }
     }
 
     // Join user-specific room
@@ -262,177 +291,49 @@ export function registerConnectionHandlers(io, socket) {
       user.isOnline = false;
       user.disconnectedAt = new Date();
 
-      // Handle active call cleanup
+      // ===== ACTIVE CALL HANDLING =====
+      // Critical bug fix: previously, the moment EITHER party's socket dropped,
+      // we would immediately mark the call as completed, run billing, wipe
+      // userStatus, and clear currentCallId. This caused a race condition where
+      // a female whose socket flapped mid-call (Android doze, network handoff —
+      // happens every ~21s in production logs for heavy users) would have her
+      // status reset to 'available' a few seconds later by the join handler,
+      // even though Twilio was still actively connected on her device.
+      // Result: a SECOND male could call her and the busy check would let it
+      // through.
+      //
+      // New behavior: if the user has an active call (currentCallId set), do
+      // NOT terminate the call immediately. Just mark them offline and let
+      // the 15s startDisconnectTimeout decide:
+      //   - If they reconnect within 15s → cancelDisconnectTimeout fires →
+      //     call continues seamlessly, status stays 'busy'.
+      //   - If they don't reconnect → the timeout callback runs the same
+      //     cleanup logic that used to be inline here.
+      //
+      // The cleanup logic itself is preserved verbatim (billing, female
+      // earnings, call logs, completeCall, participant notifications) — just
+      // moved from "fire on socket drop" to "fire after 15s grace window
+      // expires without reconnect".
       const currentStatus = getUserStatus(userId);
-      if (currentStatus && currentStatus.currentCallId) {
-        const callId = currentStatus.currentCallId;
-        const call = getActiveCall(callId);
-
-        if (call && call.status === 'completed') {
-          logger.info(`Call ${callId} already completed — skipping disconnect billing`);
-        } else if (call) {
-          logger.warn(`User ${userId} disconnected during active call ${callId}`);
-
-          // Notify other participants
-          if (call.participants) {
-            call.participants.forEach(pid => {
-              if (pid !== userId) {
-                const participant = getConnectedUser(pid);
-                if (participant && participant.isOnline) {
-                  io.to(participant.socketId).emit('participant_disconnected', {
-                    callId,
-                    disconnectedUserId: userId,
-                    reason: 'User connection lost'
-                  });
-                }
-                setUserStatus(pid, {
-                  status: 'available',
-                  currentCallId: null,
-                  lastStatusChange: new Date()
-                });
-              }
-            });
-          }
-
-          // Complete call with billing
-          const serverTimer = getCallTimer(callId);
-          if (serverTimer) {
-            clearInterval(serverTimer.interval);
-            const durationSeconds = serverTimer.durationSeconds || 0;
-            const coinRate = serverTimer.coinRate || COIN_RATES.audio;
-            const coinsDeducted = Math.ceil(durationSeconds * coinRate);
-
-            logger.info(`Call ${callId} disconnected - Duration: ${durationSeconds}s, Cost: ${coinsDeducted} coins`);
-
-            // Deduct coins from caller (non-blocking)
-            if (call.callerId && coinsDeducted > 0) {
-              try {
-                const db = getFirestore();
-                if (db) {
-                  const userRef = db.collection('users').doc(call.callerId);
-                  const userDoc = await userRef.get();
-                  const data = userDoc.data() || {};
-                  const currentBalance = data.coins ?? 0;
-                  const actualDeduction = Math.min(coinsDeducted, Math.max(0, currentBalance));
-                  if (actualDeduction > 0) {
-                    await userRef.update({
-                      coins: admin.firestore.FieldValue.increment(-actualDeduction),
-                      lastSpendAt: admin.firestore.FieldValue.serverTimestamp()
-                    });
-                  }
-                  logger.info(`Deducted ${actualDeduction} coins from ${call.callerId} for disconnected call`);
-
-                  // Fix 4: symmetric billing — calculate actual billed seconds based on what was charged
-                  let billedSeconds = durationSeconds;
-                  if (actualDeduction < coinsDeducted && coinRate > 0) {
-                    billedSeconds = Math.floor(actualDeduction / coinRate);
-                  }
-
-                  // Record female earnings for disconnect-ended calls (based on actual billed seconds)
-                  const recipientId = call.recipientId || serverTimer.recipientId;
-                  if (recipientId && billedSeconds > 0) {
-                    try {
-                      const callType = serverTimer.callType || call.callType || 'audio';
-                      const earningRate = callType === 'video' ? FEMALE_EARNING_RATES.video : FEMALE_EARNING_RATES.audio;
-                      const earningAmount = parseFloat((billedSeconds * earningRate).toFixed(2));
-                      const dateKey = new Date().toISOString().split('T')[0];
-                      const femaleEarningsRef = db.collection('female_earnings').doc(recipientId);
-
-                      await femaleEarningsRef.set({
-                        totalEarnings: admin.firestore.FieldValue.increment(earningAmount),
-                        availableBalance: admin.firestore.FieldValue.increment(earningAmount),
-                        totalCalls: admin.firestore.FieldValue.increment(1),
-                        totalDurationSeconds: admin.firestore.FieldValue.increment(billedSeconds),
-                        lastCallAt: admin.firestore.FieldValue.serverTimestamp(),
-                        lastUpdated: admin.firestore.FieldValue.serverTimestamp()
-                      }, { merge: true });
-
-                      await femaleEarningsRef.collection('daily').doc(dateKey).set({
-                        date: dateKey,
-                        earnings: admin.firestore.FieldValue.increment(earningAmount),
-                        calls: admin.firestore.FieldValue.increment(1),
-                        durationSeconds: admin.firestore.FieldValue.increment(billedSeconds),
-                        lastUpdated: admin.firestore.FieldValue.serverTimestamp()
-                      }, { merge: true });
-
-                      await femaleEarningsRef.collection('transactions').doc(callId).set({
-                        type: 'call_earning',
-                        callId,
-                        callerId: call.callerId,
-                        callType,
-                        durationSeconds: billedSeconds,
-                        amount: earningAmount,
-                        currency: 'INR',
-                        ratePerSecond: earningRate,
-                        completedAt: new Date().toISOString(),
-                        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                        status: 'completed',
-                        source: 'disconnect_recovery'
-                      });
-
-                      logger.info(`Female earnings recorded for disconnect call ${callId}: ₹${earningAmount} (based on ${billedSeconds}s actual billed) to ${recipientId}`);
-                    } catch (earningsErr) {
-                      logger.error(`Failed to record female earnings on disconnect: ${earningsErr.message}`);
-                    }
-                  }
-
-                  // Update call logs for both users
-                  await updateCallLogs({
-                    callId,
-                    callerId: call.callerId,
-                    recipientId,
-                    callType: serverTimer.callType || call.callType || 'audio',
-                    durationSeconds: billedSeconds,
-                    coinsDeducted: actualDeduction,
-                    status: 'completed',
-                    endReason: 'connection_lost',
-                    source: 'disconnect_recovery',
-                  });
-                }
-              } catch (deductErr) {
-                logger.error(`Failed to deduct coins on disconnect: ${deductErr.message}`);
-              }
-            }
-
-            // Mark call as completed before completeCall to prevent re-entry
-            call.status = 'completed';
-
-            completeCall(callId, {
-              status: 'disconnected',
-              endReason: 'connection_lost',
-              disconnectedBy: userId,
-              disconnectedAt: new Date().toISOString(),
-              endedAt: new Date().toISOString(),
-              durationSeconds,
-              coinsDeducted
-            });
-            deleteCallTimer(callId);
-            logger.info(`Call ${callId} completed on disconnect - Firestore updated`);
-          } else {
-            call.status = 'completed';
-
-            completeCall(callId, {
-              status: 'disconnected',
-              endReason: 'connection_lost_before_connect',
-              disconnectedBy: userId,
-              disconnectedAt: new Date().toISOString(),
-              endedAt: new Date().toISOString(),
-              durationSeconds: 0,
-              coinsDeducted: 0
-            });
-            logger.info(`Call ${callId} marked disconnected (no timer) - Firestore updated`);
-          }
-        }
-      }
-
-      // Set status to disconnected
-      setUserStatus(userId, {
-        status: 'disconnected',
-        currentCallId: null,
-        lastStatusChange: new Date()
-      });
-
       const userType = user.userType || 'unknown';
+      const hasActiveCall = currentStatus && currentStatus.currentCallId &&
+                            getActiveCall(currentStatus.currentCallId);
+
+      if (hasActiveCall) {
+        // PRESERVE userStatus and currentCallId. Defer call termination to
+        // the 15s startDisconnectTimeout. This prevents the mid-flap busy
+        // bypass without breaking real call termination — the timeout still
+        // fires reliably for actual force-closes.
+        logger.warn(`User ${userId} disconnected during active call ${currentStatus.currentCallId} — DEFERRING call cleanup to 15s timeout (preserves busy state during socket flap)`);
+      } else {
+        // No active call — safe to immediately mark status as disconnected.
+        // This is the original behavior for users who weren't in a call.
+        setUserStatus(userId, {
+          status: 'disconnected',
+          currentCallId: null,
+          lastStatusChange: new Date()
+        });
+      }
 
       // Female-specific updates — defer Firestore write to the 15s disconnect timeout
       // This prevents flapping (rapid online/offline) during brief reconnections
@@ -449,12 +350,197 @@ export function registerConnectionHandlers(io, socket) {
         });
       }
 
-      // Start disconnect timeout (backup mechanism)
-      startDisconnectTimeout(userId, userType, io);
-      logger.info(`User ${userId} (${userType}) disconnected - Started ${15}s timeout`);
+      // Start disconnect timeout. If user has an active call, pass a deferred
+      // cleanup callback that will run AFTER the 15s grace window if they
+      // didn't reconnect. This is the path that actually terminates the call —
+      // billing, female earnings, call logs, completeCall, participant
+      // notifications. Same logic as the old immediate-on-disconnect path,
+      // just gated by the grace window.
+      const deferredCleanup = hasActiveCall
+        ? buildDeferredCallCleanup(io, userId, currentStatus.currentCallId)
+        : null;
+      startDisconnectTimeout(userId, userType, io, deferredCleanup);
+      logger.info(`User ${userId} (${userType}) disconnected - Started ${15}s timeout${hasActiveCall ? ' (with deferred call cleanup)' : ''}`);
       break;
     }
   });
+}
+
+/**
+ * Build the deferred call-cleanup function that fires after the 15s
+ * disconnect grace window if the user hasn't reconnected. This is the
+ * same end-of-call billing pipeline that used to run immediately on socket
+ * disconnect — just delayed so transient mobile-network flaps don't
+ * terminate live calls.
+ */
+function buildDeferredCallCleanup(io, userId, callId) {
+  return async () => {
+    const call = getActiveCall(callId);
+    if (!call) {
+      logger.info(`Deferred cleanup for ${callId}: call already gone (cleaned by other path) — skipping`);
+      return;
+    }
+    if (call.status === 'completed') {
+      logger.info(`Deferred cleanup for ${callId}: call already completed — skipping`);
+      return;
+    }
+
+    logger.warn(`Deferred call cleanup firing for ${callId} (user ${userId} did not reconnect within 15s grace)`);
+
+    // Notify other participants
+    if (call.participants) {
+      call.participants.forEach(pid => {
+        if (pid !== userId) {
+          const participant = getConnectedUser(pid);
+          if (participant && participant.isOnline) {
+            io.to(participant.socketId).emit('participant_disconnected', {
+              callId,
+              disconnectedUserId: userId,
+              reason: 'User connection lost'
+            });
+          }
+          setUserStatus(pid, {
+            status: 'available',
+            currentCallId: null,
+            lastStatusChange: new Date()
+          });
+        }
+      });
+    }
+
+    // Complete call with billing
+    const serverTimer = getCallTimer(callId);
+    if (serverTimer) {
+      clearInterval(serverTimer.interval);
+      const durationSeconds = serverTimer.durationSeconds || 0;
+      const coinRate = serverTimer.coinRate || COIN_RATES.audio;
+      const coinsDeducted = Math.ceil(durationSeconds * coinRate);
+
+      logger.info(`Call ${callId} disconnected - Duration: ${durationSeconds}s, Cost: ${coinsDeducted} coins`);
+
+      // Deduct coins from caller
+      if (call.callerId && coinsDeducted > 0) {
+        try {
+          const db = getFirestore();
+          if (db) {
+            const userRef = db.collection('users').doc(call.callerId);
+            const userDoc = await userRef.get();
+            const data = userDoc.data() || {};
+            const currentBalance = data.coins ?? 0;
+            const actualDeduction = Math.min(coinsDeducted, Math.max(0, currentBalance));
+            if (actualDeduction > 0) {
+              await userRef.update({
+                coins: admin.firestore.FieldValue.increment(-actualDeduction),
+                lastSpendAt: admin.firestore.FieldValue.serverTimestamp()
+              });
+            }
+            logger.info(`Deducted ${actualDeduction} coins from ${call.callerId} for disconnected call`);
+
+            let billedSeconds = durationSeconds;
+            if (actualDeduction < coinsDeducted && coinRate > 0) {
+              billedSeconds = Math.floor(actualDeduction / coinRate);
+            }
+
+            // Record female earnings
+            const recipientId = call.recipientId || serverTimer.recipientId;
+            if (recipientId && billedSeconds > 0) {
+              try {
+                const callType = serverTimer.callType || call.callType || 'audio';
+                const earningRate = callType === 'video' ? FEMALE_EARNING_RATES.video : FEMALE_EARNING_RATES.audio;
+                const earningAmount = parseFloat((billedSeconds * earningRate).toFixed(2));
+                const dateKey = new Date().toISOString().split('T')[0];
+                const femaleEarningsRef = db.collection('female_earnings').doc(recipientId);
+
+                await femaleEarningsRef.set({
+                  totalEarnings: admin.firestore.FieldValue.increment(earningAmount),
+                  availableBalance: admin.firestore.FieldValue.increment(earningAmount),
+                  totalCalls: admin.firestore.FieldValue.increment(1),
+                  totalDurationSeconds: admin.firestore.FieldValue.increment(billedSeconds),
+                  lastCallAt: admin.firestore.FieldValue.serverTimestamp(),
+                  lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+                }, { merge: true });
+
+                await femaleEarningsRef.collection('daily').doc(dateKey).set({
+                  date: dateKey,
+                  earnings: admin.firestore.FieldValue.increment(earningAmount),
+                  calls: admin.firestore.FieldValue.increment(1),
+                  durationSeconds: admin.firestore.FieldValue.increment(billedSeconds),
+                  lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+                }, { merge: true });
+
+                await femaleEarningsRef.collection('transactions').doc(callId).set({
+                  type: 'call_earning',
+                  callId,
+                  callerId: call.callerId,
+                  callType,
+                  durationSeconds: billedSeconds,
+                  amount: earningAmount,
+                  currency: 'INR',
+                  ratePerSecond: earningRate,
+                  completedAt: new Date().toISOString(),
+                  createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                  status: 'completed',
+                  source: 'disconnect_recovery'
+                });
+
+                logger.info(`Female earnings recorded for disconnect call ${callId}: Rs.${earningAmount} (based on ${billedSeconds}s actual billed) to ${recipientId}`);
+              } catch (earningsErr) {
+                logger.error(`Failed to record female earnings on disconnect: ${earningsErr.message}`);
+              }
+            }
+
+            // Update call logs
+            await updateCallLogs({
+              callId,
+              callerId: call.callerId,
+              recipientId,
+              callType: serverTimer.callType || call.callType || 'audio',
+              durationSeconds: billedSeconds,
+              coinsDeducted: actualDeduction,
+              status: 'completed',
+              endReason: 'connection_lost',
+              source: 'disconnect_recovery',
+            });
+          }
+        } catch (deductErr) {
+          logger.error(`Failed to deduct coins on disconnect: ${deductErr.message}`);
+        }
+      }
+
+      call.status = 'completed';
+      completeCall(callId, {
+        status: 'disconnected',
+        endReason: 'connection_lost',
+        disconnectedBy: userId,
+        disconnectedAt: new Date().toISOString(),
+        endedAt: new Date().toISOString(),
+        durationSeconds,
+        coinsDeducted
+      });
+      deleteCallTimer(callId);
+      logger.info(`Call ${callId} completed on disconnect - Firestore updated`);
+    } else {
+      // No timer means the call was still in pre-accept state (ringing).
+      call.status = 'completed';
+      completeCall(callId, {
+        status: 'disconnected',
+        endReason: 'connection_lost_before_connect',
+        disconnectedBy: userId,
+        disconnectedAt: new Date().toISOString(),
+        endedAt: new Date().toISOString(),
+        durationSeconds: 0,
+        coinsDeducted: 0
+      });
+      logger.info(`Call ${callId} marked disconnected (no timer) - Firestore updated`);
+    }
+
+    // Now that call is fully cleaned up, finalize disconnected user's status
+    setUserStatus(userId, {
+      status: 'disconnected',
+      currentCallId: null,
+      lastStatusChange: new Date()
+    });
+  };
 }
 
 /**

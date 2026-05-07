@@ -88,6 +88,29 @@ router.post('/start', async (req, res) => {
 
     logger.info(`Starting call: ${callId} (${callType}) - Caller: ${callerId}, Recipient: ${recipientId}`);
 
+    // ===== ACTIVE-CALL CROSS-CHECK (defense in depth) =====
+    // Even if userStatus is wrong (e.g., reset to 'available' by a stale
+    // disconnect/reconnect race), the activeCalls map is the authoritative
+    // truth: if there's an active call where this recipient is a participant,
+    // we MUST reject. Twilio is still actively connected on her device.
+    // Logged as WARN so we can monitor busy-rejection rate in production.
+    const activeCalls = getAllActiveCalls();
+    for (const [activeCallId, activeCall] of activeCalls.entries()) {
+      if (activeCall.status === 'completed') continue;
+      const recipientInActiveCall = activeCall.recipientId === recipientId ||
+                                     activeCall.callerId === recipientId ||
+                                     (Array.isArray(activeCall.participants) && activeCall.participants.includes(recipientId));
+      if (recipientInActiveCall) {
+        logger.warn(`HTTP /api/calls/start REJECTED: recipient ${recipientId} already in active call ${activeCallId} (callType=${activeCall.callType}) — blocking call ${callId} from caller ${callerId}`);
+        return res.status(400).json({
+          error: 'Recipient is not available',
+          recipientStatus: 'busy',
+          is_busy: true,
+          message: 'User is currently on another call'
+        });
+      }
+    }
+
     // Check recipient availability
     const recipientStatus = getUserStatus(recipientId);
     const recipientConnection = getConnectedUser(recipientId);
@@ -105,9 +128,11 @@ router.post('/start', async (req, res) => {
     if (!hasConnection) actualStatus = 'unavailable';
 
     if (actualStatus !== 'available') {
+      logger.warn(`HTTP /api/calls/start REJECTED: recipient ${recipientId} status=${actualStatus} (call ${callId} from caller ${callerId})`);
       return res.status(400).json({
         error: 'Recipient is not available',
         recipientStatus: actualStatus,
+        is_busy: actualStatus === 'busy' || actualStatus === 'ringing',
         message: actualStatus === 'busy' ? 'User is currently on another call'
           : actualStatus === 'ringing' ? 'User is receiving another call'
           : 'User is currently unavailable for calls'
