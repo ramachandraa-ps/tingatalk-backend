@@ -418,13 +418,27 @@ router.post('/complete', async (req, res) => {
           logger.warn(`Top-up check/apply failed for ${finalCallId}: ${topupErr.message}`);
         }
 
+        // PREFER existing authoritative server values over client-reported.
+        // If a previous billing path (auto-end / disconnect-recovery / etc.)
+        // already wrote durationSeconds/coinsDeducted, those are the truth —
+        // don't overwrite them with whatever the late client says. Use client
+        // values only when no server data exists yet.
+        const recordedDur = (existingCallData && existingCallData.durationSeconds) || 0;
+        const recordedCoins = (existingCallData && existingCallData.coinsDeducted) || 0;
+        const finalDurationSeconds = recordedDur > 0 ? recordedDur : (client_duration_seconds || 0);
+        const finalCoinsDeducted = recordedCoins > 0 ? recordedCoins : (client_coins_deducted || 0);
+        // If we already had authoritative data, preserve the original
+        // billingSource. Only mark 'client_fallback' if client values were used.
+        const finalBillingSource = (existingCallData && existingCallData.billingSource) || 'client_fallback';
+
         if (db) {
           await db.collection('calls').doc(finalCallId).update({
-            status: 'completed', durationSeconds: client_duration_seconds || 0,
-            coinsDeducted: client_coins_deducted || 0,
+            status: (existingCallData && existingCallData.status) || 'completed',
+            durationSeconds: finalDurationSeconds,
+            coinsDeducted: finalCoinsDeducted,
             endedAt: new Date().toISOString(),
-            endReason: endReason || 'User ended call',
-            billingSource: 'client_fallback',
+            endReason: endReason || (existingCallData && existingCallData.endReason) || 'User ended call',
+            billingSource: finalBillingSource,
             ...(topupApplied && { topupApplied }),
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
           }).catch(() => {});
@@ -432,11 +446,14 @@ router.post('/complete', async (req, res) => {
 
         return res.json({
           success: true, callId: finalCallId,
-          durationSeconds: client_duration_seconds || 0,
-          coinsDeducted: client_coins_deducted || 0,
-          newBalance: null, source: 'client_fallback',
+          durationSeconds: finalDurationSeconds,
+          coinsDeducted: finalCoinsDeducted,
+          newBalance: null,
+          source: finalBillingSource,
           ...(topupApplied && { topupApplied }),
-          warning: 'Server timer not found, used client-reported values'
+          warning: recordedDur > 0
+            ? 'Server timer not found; preserved existing authoritative values'
+            : 'Server timer not found, used client-reported values'
         });
       }
 

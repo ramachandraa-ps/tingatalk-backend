@@ -33,7 +33,7 @@ import { updateCallLogs } from './callLogUtil.js';
  * @param {string} args.callId
  * @param {Object} args.timer    - timer object (must have callerId, recipientId, callType, coinRate, callerName, durationSeconds)
  * @param {string} args.endReason
- * @param {string} args.source   - 'normal_completion' | 'server_auto_end' | 'disconnect_recovery'
+ * @param {string} args.source   - 'normal_completion' | 'server_auto_end' | 'disconnect_recovery' | 'stale_call_recovery'
  * @param {Object} args.db       - Firestore instance
  * @param {Object} [args.io]     - Socket.IO server (optional; if missing, socket emit is skipped)
  * @param {string} [args.endedBy] - Override for who ended the call. Defaults to source-based auto-detect.
@@ -89,12 +89,17 @@ export async function performCallBilling({ callId, timer, endReason, source, db,
     // Preserve fraud-detection field that the HTTP /api/calls/complete path
     // computes by comparing client-reported vs server-tracked durations.
     if (fraudDetection) callDocUpdate.fraudDetection = fraudDetection;
-    // Source-specific call-doc fields preserved for audit (status='disconnected'
-    // for disconnect-recovery so existing dashboards still distinguish).
+    // Source-specific call-doc fields preserved for audit so existing
+    // dashboards still distinguish HOW the call ended.
     if (source === 'disconnect_recovery') {
       callDocUpdate.status = 'disconnected';
       callDocUpdate.disconnectedBy = endedBy || timer.callerId;
       callDocUpdate.disconnectedAt = new Date().toISOString();
+    } else if (source === 'stale_call_recovery') {
+      // Heartbeat timeout — server-detected call abandonment.
+      // Status is 'timeout_heartbeat' so backgroundJobs idempotency check
+      // (line 78 includes this status) skips re-processing.
+      callDocUpdate.status = 'timeout_heartbeat';
     }
     await db.collection('calls').doc(callId).update(callDocUpdate);
   } catch (e) {
@@ -141,7 +146,8 @@ export async function performCallBilling({ callId, timer, endReason, source, db,
         ratePerSecond: earningRate,
         completedAt: new Date().toISOString(),
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        status: 'completed'
+        status: 'completed',
+        source, // audit: which billing path produced this earning
       });
     } catch (e) {
       logger.error(`performCallBilling: female earnings failed for ${callId}: ${e.message}`);
@@ -214,9 +220,11 @@ export async function performCallBilling({ callId, timer, endReason, source, db,
           endedBy: endedBy
             || (source === 'server_auto_end' ? 'server'
               : source === 'disconnect_recovery' ? 'disconnected_user'
+              : source === 'stale_call_recovery' ? 'server'
               : (timer.endedBy || callerId)),
           reason: source === 'server_auto_end' ? 'insufficient_balance'
             : source === 'disconnect_recovery' ? 'connection_lost'
+            : source === 'stale_call_recovery' ? 'heartbeat_timeout'
             : undefined,
           timestamp: new Date().toISOString()
         };

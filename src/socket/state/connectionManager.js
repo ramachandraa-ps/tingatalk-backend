@@ -80,32 +80,24 @@ export function getAllUserStatuses() {
 }
 
 // --- Active Calls ---
+// In-memory + Redis only. Firestore write happens at /api/calls/start (which
+// runs BEFORE this) and at accept_call's auto-start branch (which runs AFTER
+// this if no HTTP timer was created). Previously this function ALSO wrote to
+// Firestore, which caused two bugs:
+//   1) coinRatePerSecond got overwritten to 0 because the call object passed
+//      from socket.on('initiate_call') has no coinRate field
+//   2) durationSeconds and coinsDeducted got reset to 0 if this function was
+//      somehow called after billing — Firestore merge:true preserves stale
+//      zeros from this write while overwriting the just-written billing data
+// Removing the Firestore write here eliminates both. The other writers
+// (calls.routes.js /api/calls/start line 165, call.handler.js accept_call
+// line 441) remain authoritative.
 export function setActiveCall(callId, callData) {
   activeCalls.set(callId, callData);
   const redis = getRedis();
   if (redis) {
     redis.hset('active_calls', callId, JSON.stringify(callData)).catch(err =>
       logger.error(`Error syncing call to Redis: ${err.message}`)
-    );
-  }
-  // Also save to Firestore
-  const db = getFirestore();
-  if (db) {
-    const firestoreData = {
-      callId: callData.callId,
-      callerId: callData.callerId,
-      recipientId: callData.recipientId,
-      callType: callData.callType,
-      roomName: callData.roomName || '',
-      status: callData.status || 'initiated',
-      coinRatePerSecond: callData.coinRate || 0,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      durationSeconds: callData.durationSeconds || 0,
-      coinsDeducted: callData.coinsDeducted || 0
-    };
-    db.collection('calls').doc(callId).set(firestoreData, { merge: true }).catch(err =>
-      logger.error(`Error saving call to Firestore: ${err.message}`)
     );
   }
 }

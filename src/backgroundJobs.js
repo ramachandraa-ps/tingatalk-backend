@@ -7,14 +7,13 @@ import { getRedis } from './config/redis.js';
 import { getFirestore, admin } from './config/firebase.js';
 import {
   getAllCallTimers, deleteCallTimer, setUserStatus, deleteActiveCall,
-  getConnectedUser, getAllActiveCalls, getAllConnectedUsers
+  getAllActiveCalls, getAllConnectedUsers
 } from './socket/state/connectionManager.js';
 import {
   HEARTBEAT_TIMEOUT_MS, HEARTBEAT_CHECK_INTERVAL_MS,
   MAX_CONCURRENT_CALLS, REDIS_CALL_TIMER_EXPIRY, COIN_RATES,
-  FEMALE_EARNING_RATES
 } from './shared/constants.js';
-import { updateCallLogs } from './utils/callLogUtil.js';
+import { performCallBilling } from './utils/callBillingUtil.js';
 import { startMarketingNotificationJob, stopMarketingNotificationJob } from './features/notifications/marketingNotification.js';
 
 let heartbeatIntervalId = null;
@@ -90,114 +89,35 @@ function startHeartbeatMonitor(io) {
 
         staleCallsFound++;
         logger.warn(`STALE CALL DETECTED: ${callId} - No heartbeat for ${Math.round(timeSinceLastHeartbeat / 1000)}s`);
+        logger.info(`Auto-ending stale call ${callId} via performCallBilling`);
 
-        const finalDuration = rawDuration;
-        const coinsToDeduct = Math.ceil(finalDuration * (timer.coinRate || 0));
-
-        logger.info(`Auto-ending stale call ${callId}: ${finalDuration}s, ${coinsToDeduct} coins`);
-
-        // Deduct coins and update Firestore — use ACTUAL deduction for symmetric billing (Fix 4)
-        let actualCoinsDeducted = 0;
-        let actualBilledSeconds = finalDuration;
+        // Delegate billing to single source of truth.
+        // Female now gets credit for the FULL call duration regardless of male's
+        // wallet shortfall (matches behavior of all other paths after the
+        // Issue #3 + Issue #4 refactor). Male is still capped by the balance
+        // guard inside performCallBilling.
         try {
           const db = getFirestore();
           if (db && timer.callerId) {
-            await db.runTransaction(async (transaction) => {
-              const userRef = db.collection('users').doc(timer.callerId);
-              const userDoc = await transaction.get(userRef);
-              if (userDoc.exists) {
-                const currentBalance = userDoc.data().coins ?? 0;
-                actualCoinsDeducted = Math.min(coinsToDeduct, Math.max(0, currentBalance));
-                const newBalance = currentBalance - actualCoinsDeducted;
-                transaction.update(userRef, {
-                  coins: newBalance,
-                  lastDeductedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
-              }
-            });
-
-            // Fix 4: Calculate actual billed seconds based on what was actually charged
-            if (actualCoinsDeducted < coinsToDeduct && timer.coinRate > 0) {
-              actualBilledSeconds = Math.floor(actualCoinsDeducted / timer.coinRate);
-            }
-
-            await db.collection('calls').doc(callId).update({
-              status: 'timeout_heartbeat',
-              durationSeconds: actualBilledSeconds,
-              coinsDeducted: actualCoinsDeducted,
-              endedAt: admin.firestore.FieldValue.serverTimestamp(),
-              endReason: 'No heartbeat received - connection lost'
-            });
-            logger.info(`Stale call ${callId} billed and closed: ${actualCoinsDeducted} coins deducted (requested: ${coinsToDeduct}, actual billed seconds: ${actualBilledSeconds})`);
-
-            // Fix 4: Record female earnings based on ACTUAL billed seconds (symmetric)
-            if (timer.recipientId && actualBilledSeconds > 0) {
-              try {
-                const callType = timer.callType || 'audio';
-                const earningRate = callType === 'video' ? FEMALE_EARNING_RATES.video : FEMALE_EARNING_RATES.audio;
-                const earningAmount = parseFloat((actualBilledSeconds * earningRate).toFixed(2));
-                const dateKey = new Date().toISOString().split('T')[0];
-                const femaleEarningsRef = db.collection('female_earnings').doc(timer.recipientId);
-
-                await femaleEarningsRef.set({
-                  totalEarnings: admin.firestore.FieldValue.increment(earningAmount),
-                  availableBalance: admin.firestore.FieldValue.increment(earningAmount),
-                  totalCalls: admin.firestore.FieldValue.increment(1),
-                  totalDurationSeconds: admin.firestore.FieldValue.increment(actualBilledSeconds),
-                  lastCallAt: admin.firestore.FieldValue.serverTimestamp(),
-                  lastUpdated: admin.firestore.FieldValue.serverTimestamp()
-                }, { merge: true });
-
-                await femaleEarningsRef.collection('daily').doc(dateKey).set({
-                  date: dateKey,
-                  earnings: admin.firestore.FieldValue.increment(earningAmount),
-                  calls: admin.firestore.FieldValue.increment(1),
-                  durationSeconds: admin.firestore.FieldValue.increment(actualBilledSeconds),
-                  lastUpdated: admin.firestore.FieldValue.serverTimestamp()
-                }, { merge: true });
-
-                await femaleEarningsRef.collection('transactions').doc(callId).set({
-                  type: 'call_earning',
-                  callId,
-                  callerId: timer.callerId,
-                  callType,
-                  durationSeconds: actualBilledSeconds,
-                  amount: earningAmount,
-                  currency: 'INR',
-                  ratePerSecond: earningRate,
-                  completedAt: new Date().toISOString(),
-                  createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                  status: 'completed',
-                  source: 'stale_call_recovery'
-                });
-
-                logger.info(`Female earnings recorded for stale call ${callId}: ₹${earningAmount} (based on actual billed ${actualBilledSeconds}s) to ${timer.recipientId}`);
-              } catch (earningsError) {
-                logger.error(`Failed to record female earnings for stale call ${callId}: ${earningsError.message}`);
-              }
-            }
-
-            // Update call logs for both users
-            await updateCallLogs({
+            await performCallBilling({
               callId,
-              callerId: timer.callerId,
-              recipientId: timer.recipientId,
-              callType: timer.callType || 'audio',
-              durationSeconds: actualBilledSeconds,
-              coinsDeducted: actualCoinsDeducted,
-              status: 'completed',
-              endReason: 'connection_lost',
+              timer,
+              endReason: 'No heartbeat received - connection lost',
               source: 'stale_call_recovery',
+              db,
+              io,
+              endedBy: 'server',
             });
           }
         } catch (error) {
           logger.error(`Error closing stale call ${callId}: ${error.message}`);
         }
 
-        // Clean up call timer
+        // Clean up call timer (performCallBilling didn't delete it — that's
+        // intentionally caller's responsibility for flexibility)
         deleteCallTimer(callId);
 
-        // Reset user statuses
+        // Reset user statuses (also intentionally caller's responsibility)
         if (timer.callerId) {
           setUserStatus(timer.callerId, {
             status: 'available',
@@ -213,19 +133,8 @@ function startHeartbeatMonitor(io) {
           });
         }
 
-        // Notify users via WebSocket
-        const callerConn = timer.callerId ? getConnectedUser(timer.callerId) : null;
-        const recipientConn = timer.recipientId ? getConnectedUser(timer.recipientId) : null;
-
-        const endPayload = {
-          callId,
-          endedBy: 'server',
-          reason: 'Connection timeout - no heartbeat',
-          duration: finalDuration
-        };
-
-        if (callerConn) io.to(callerConn.socketId).emit('call_ended', endPayload);
-        if (recipientConn) io.to(recipientConn.socketId).emit('call_ended', endPayload);
+        // call_ended socket emit is handled by performCallBilling — no need to
+        // emit again here.
 
         // Clean from active calls
         deleteActiveCall(callId);
