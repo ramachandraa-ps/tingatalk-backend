@@ -1,12 +1,13 @@
 // ============================================================================
 // Call Billing Utility — single source of truth for end-of-call billing
-// Used by both:
+// Used by ALL call-end paths:
 //   - /api/calls/complete       (manual end by male/female via HTTP)
 //   - mid-call auto-end timers  (server-initiated when balance runs out)
+//   - disconnect-recovery       (15s post-disconnect cleanup, no reconnect)
 //
-// Without this helper, the server-initiated path used to skip all billing
-// (just killed the timer + emitted call_ended), so coins were never deducted
-// from the male and female earnings were never credited.
+// Centralizing here prevents the path-divergence bug where each path used
+// slightly different logic for female-earnings calculation, leaving some
+// hosts under-credited compared to others depending on how their calls ended.
 // ============================================================================
 
 import { admin } from '../config/firebase.js';
@@ -32,12 +33,14 @@ import { updateCallLogs } from './callLogUtil.js';
  * @param {string} args.callId
  * @param {Object} args.timer    - timer object (must have callerId, recipientId, callType, coinRate, callerName, durationSeconds)
  * @param {string} args.endReason
- * @param {string} args.source   - 'normal_completion' | 'server_auto_end' (used in callLogs + callDoc.billingSource)
+ * @param {string} args.source   - 'normal_completion' | 'server_auto_end' | 'disconnect_recovery'
  * @param {Object} args.db       - Firestore instance
  * @param {Object} [args.io]     - Socket.IO server (optional; if missing, socket emit is skipped)
+ * @param {string} [args.endedBy] - Override for who ended the call. Defaults to source-based auto-detect.
+ * @param {Object} [args.fraudDetection] - Optional fraud-detection metadata to write to call doc.
  * @returns {Promise<{actualDeduction:number, durationSeconds:number, newBalance:number, earningAmount:number}>}
  */
-export async function performCallBilling({ callId, timer, endReason, source, db, io }) {
+export async function performCallBilling({ callId, timer, endReason, source, db, io, endedBy, fraudDetection }) {
   const callerId = timer.callerId;
   const recipientId = timer.recipientId;
   const callType = timer.callType;
@@ -74,7 +77,7 @@ export async function performCallBilling({ callId, timer, endReason, source, db,
 
   // 2. Update call doc with billing metadata
   try {
-    await db.collection('calls').doc(callId).update({
+    const callDocUpdate = {
       status: 'completed',
       durationSeconds,
       coinsDeducted: actualDeduction,
@@ -82,7 +85,18 @@ export async function performCallBilling({ callId, timer, endReason, source, db,
       endReason: endReason || 'completed',
       billingSource: source,
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
-    });
+    };
+    // Preserve fraud-detection field that the HTTP /api/calls/complete path
+    // computes by comparing client-reported vs server-tracked durations.
+    if (fraudDetection) callDocUpdate.fraudDetection = fraudDetection;
+    // Source-specific call-doc fields preserved for audit (status='disconnected'
+    // for disconnect-recovery so existing dashboards still distinguish).
+    if (source === 'disconnect_recovery') {
+      callDocUpdate.status = 'disconnected';
+      callDocUpdate.disconnectedBy = endedBy || timer.callerId;
+      callDocUpdate.disconnectedAt = new Date().toISOString();
+    }
+    await db.collection('calls').doc(callId).update(callDocUpdate);
   } catch (e) {
     logger.warn(`performCallBilling: call doc update failed for ${callId}: ${e.message}`);
   }
@@ -197,8 +211,13 @@ export async function performCallBilling({ callId, timer, endReason, source, db,
           coinsDeducted: actualDeduction,
           endReason: endReason || 'completed',
           callType,
-          endedBy: source === 'server_auto_end' ? 'server' : (timer.endedBy || callerId),
-          reason: source === 'server_auto_end' ? 'insufficient_balance' : undefined,
+          endedBy: endedBy
+            || (source === 'server_auto_end' ? 'server'
+              : source === 'disconnect_recovery' ? 'disconnected_user'
+              : (timer.endedBy || callerId)),
+          reason: source === 'server_auto_end' ? 'insufficient_balance'
+            : source === 'disconnect_recovery' ? 'connection_lost'
+            : undefined,
           timestamp: new Date().toISOString()
         };
         if (uid === recipientId) {

@@ -17,8 +17,7 @@ import {
 // + WebSocketService races), we process the first and silently ack the rest.
 const recentJoinsByUser = new Map(); // userId -> timestamp
 const JOIN_DEDUP_WINDOW_MS = 1000;
-import { COIN_RATES, FEMALE_EARNING_RATES } from '../../shared/constants.js';
-import { updateCallLogs } from '../../utils/callLogUtil.js';
+import { performCallBilling } from '../../utils/callBillingUtil.js';
 
 export function registerConnectionHandlers(io, socket) {
 
@@ -413,114 +412,52 @@ function buildDeferredCallCleanup(io, userId, callId) {
     if (serverTimer) {
       clearInterval(serverTimer.interval);
       const durationSeconds = serverTimer.durationSeconds || 0;
-      const coinRate = serverTimer.coinRate || COIN_RATES.audio;
-      const coinsDeducted = Math.ceil(durationSeconds * coinRate);
+      logger.info(`Call ${callId} disconnected after grace window - Duration: ${durationSeconds}s`);
 
-      logger.info(`Call ${callId} disconnected - Duration: ${durationSeconds}s, Cost: ${coinsDeducted} coins`);
-
-      // Deduct coins from caller
-      if (call.callerId && coinsDeducted > 0) {
+      // Delegate billing to single source of truth.
+      // CHANGED FROM PRIOR BEHAVIOR: female now earns for the FULL call duration
+      // instead of only the duration covered by the male's wallet (which was
+      // creating talk-time discrepancies between disconnect-recovery calls and
+      // normal-completion calls). Male is still capped by the balance guard
+      // inside performCallBilling — any uncharged delta is platform loss,
+      // matching how server_auto_end already worked.
+      const db = getFirestore();
+      if (db) {
         try {
-          const db = getFirestore();
-          if (db) {
-            const userRef = db.collection('users').doc(call.callerId);
-            const userDoc = await userRef.get();
-            const data = userDoc.data() || {};
-            const currentBalance = data.coins ?? 0;
-            const actualDeduction = Math.min(coinsDeducted, Math.max(0, currentBalance));
-            if (actualDeduction > 0) {
-              await userRef.update({
-                coins: admin.firestore.FieldValue.increment(-actualDeduction),
-                lastSpendAt: admin.firestore.FieldValue.serverTimestamp()
-              });
-            }
-            logger.info(`Deducted ${actualDeduction} coins from ${call.callerId} for disconnected call`);
-
-            let billedSeconds = durationSeconds;
-            if (actualDeduction < coinsDeducted && coinRate > 0) {
-              billedSeconds = Math.floor(actualDeduction / coinRate);
-            }
-
-            // Record female earnings
-            const recipientId = call.recipientId || serverTimer.recipientId;
-            if (recipientId && billedSeconds > 0) {
-              try {
-                const callType = serverTimer.callType || call.callType || 'audio';
-                const earningRate = callType === 'video' ? FEMALE_EARNING_RATES.video : FEMALE_EARNING_RATES.audio;
-                const earningAmount = parseFloat((billedSeconds * earningRate).toFixed(2));
-                const dateKey = new Date().toISOString().split('T')[0];
-                const femaleEarningsRef = db.collection('female_earnings').doc(recipientId);
-
-                await femaleEarningsRef.set({
-                  totalEarnings: admin.firestore.FieldValue.increment(earningAmount),
-                  availableBalance: admin.firestore.FieldValue.increment(earningAmount),
-                  totalCalls: admin.firestore.FieldValue.increment(1),
-                  totalDurationSeconds: admin.firestore.FieldValue.increment(billedSeconds),
-                  lastCallAt: admin.firestore.FieldValue.serverTimestamp(),
-                  lastUpdated: admin.firestore.FieldValue.serverTimestamp()
-                }, { merge: true });
-
-                await femaleEarningsRef.collection('daily').doc(dateKey).set({
-                  date: dateKey,
-                  earnings: admin.firestore.FieldValue.increment(earningAmount),
-                  calls: admin.firestore.FieldValue.increment(1),
-                  durationSeconds: admin.firestore.FieldValue.increment(billedSeconds),
-                  lastUpdated: admin.firestore.FieldValue.serverTimestamp()
-                }, { merge: true });
-
-                await femaleEarningsRef.collection('transactions').doc(callId).set({
-                  type: 'call_earning',
-                  callId,
-                  callerId: call.callerId,
-                  callType,
-                  durationSeconds: billedSeconds,
-                  amount: earningAmount,
-                  currency: 'INR',
-                  ratePerSecond: earningRate,
-                  completedAt: new Date().toISOString(),
-                  createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                  status: 'completed',
-                  source: 'disconnect_recovery'
-                });
-
-                logger.info(`Female earnings recorded for disconnect call ${callId}: Rs.${earningAmount} (based on ${billedSeconds}s actual billed) to ${recipientId}`);
-              } catch (earningsErr) {
-                logger.error(`Failed to record female earnings on disconnect: ${earningsErr.message}`);
-              }
-            }
-
-            // Update call logs
-            await updateCallLogs({
-              callId,
-              callerId: call.callerId,
-              recipientId,
+          await performCallBilling({
+            callId,
+            timer: {
+              ...serverTimer,
+              callerId: call.callerId || serverTimer.callerId,
+              recipientId: call.recipientId || serverTimer.recipientId,
               callType: serverTimer.callType || call.callType || 'audio',
-              durationSeconds: billedSeconds,
-              coinsDeducted: actualDeduction,
-              status: 'completed',
-              endReason: 'connection_lost',
-              source: 'disconnect_recovery',
-            });
-          }
-        } catch (deductErr) {
-          logger.error(`Failed to deduct coins on disconnect: ${deductErr.message}`);
+              callerName: serverTimer.callerName || call.callerName,
+            },
+            endReason: 'connection_lost',
+            source: 'disconnect_recovery',
+            db,
+            io,
+            endedBy: userId,
+          });
+        } catch (billErr) {
+          logger.error(`performCallBilling failed in disconnect-recovery for ${callId}: ${billErr.message}`);
         }
       }
 
+      // Mark in-memory state and clean up
       call.status = 'completed';
+      // completeCall removes from activeCalls map (Firestore was already updated by performCallBilling).
+      // Pass minimal updates here — performCallBilling already wrote durationSeconds/coinsDeducted/status.
       completeCall(callId, {
-        status: 'disconnected',
-        endReason: 'connection_lost',
+        // Don't overwrite the fields performCallBilling already set — pass only audit-extras
         disconnectedBy: userId,
         disconnectedAt: new Date().toISOString(),
-        endedAt: new Date().toISOString(),
-        durationSeconds,
-        coinsDeducted
       });
       deleteCallTimer(callId);
-      logger.info(`Call ${callId} completed on disconnect - Firestore updated`);
+      logger.info(`Call ${callId} completed on disconnect - Firestore updated via performCallBilling`);
     } else {
       // No timer means the call was still in pre-accept state (ringing).
+      // Nothing to bill — just mark Firestore + clean in-memory state.
       call.status = 'completed';
       completeCall(callId, {
         status: 'disconnected',

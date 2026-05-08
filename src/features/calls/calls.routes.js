@@ -10,9 +10,8 @@ import {
 } from '../../socket/state/connectionManager.js';
 import {
   COIN_RATES, MIN_BALANCE, MIN_CALL_DURATION_SECONDS,
-  FEMALE_EARNING_RATES, ENDED_CALL_STATUSES
+  FEMALE_EARNING_RATES
 } from '../../shared/constants.js';
-import { updateCallLogs } from '../../utils/callLogUtil.js';
 import { performCallBilling } from '../../utils/callBillingUtil.js';
 
 const router = Router();
@@ -320,27 +319,33 @@ router.post('/complete', async (req, res) => {
 
     logger.info(`Completing call: ${finalCallId}`);
 
-    // Idempotency: skip re-billing if SERVER already billed this call.
-    // billingSource is set to 'server' (manual end via this endpoint) or
-    // 'server_auto_end' (mid-call auto-end via the billing timer).
+    // Idempotency: skip re-billing if SERVER already billed this call via any path.
+    // billingSource can be 'server' (legacy), 'normal_completion', 'server_auto_end',
+    // or 'disconnect_recovery' — all of these are authoritative server-side billings.
+    // Only 'client_fallback' is NOT considered fully billed (allows the no-timer path
+    // to top up female earnings if the client reports a longer duration than recorded).
+    const ALREADY_BILLED_SOURCES = new Set([
+      'server', 'normal_completion', 'server_auto_end', 'disconnect_recovery',
+    ]);
     const db = getFirestore();
+    let existingCallData = null;
     if (db) {
       try {
         const existingCall = await db.collection('calls').doc(finalCallId).get();
         if (existingCall.exists) {
-          const existing = existingCall.data();
-          const alreadyBilled = existing.status === 'completed' &&
-            (existing.billingSource === 'server' || existing.billingSource === 'server_auto_end');
+          existingCallData = existingCall.data();
+          const alreadyBilled = existingCallData.status === 'completed' &&
+            ALREADY_BILLED_SOURCES.has(existingCallData.billingSource);
           if (alreadyBilled) {
-            logger.info(`Call ${finalCallId} already billed (source: ${existing.billingSource}) — returning cached result`);
+            logger.info(`Call ${finalCallId} already billed (source: ${existingCallData.billingSource}) — returning cached result`);
             return res.json({
               success: true, callId: finalCallId,
-              durationSeconds: existing.durationSeconds || 0,
-              coinsDeducted: existing.coinsDeducted || 0,
+              durationSeconds: existingCallData.durationSeconds || 0,
+              coinsDeducted: existingCallData.coinsDeducted || 0,
               newBalance: null,
-              source: existing.billingSource === 'server_auto_end' ? 'server_auto_end' : 'already_completed',
+              source: existingCallData.billingSource === 'server_auto_end' ? 'server_auto_end' : 'already_completed',
               duplicate: true,
-              message: existing.billingSource === 'server_auto_end'
+              message: existingCallData.billingSource === 'server_auto_end'
                 ? 'Call ended by server (insufficient balance) and was already billed'
                 : 'Call was already completed and billed'
             });
@@ -358,6 +363,61 @@ router.post('/complete', async (req, res) => {
       logger.warn(`No server timer found for call ${finalCallId}`);
 
       if (client_duration_seconds !== undefined) {
+        // Top-up logic: if disconnect-recovery already ran and recorded a SHORTER
+        // duration than the client now reports, credit the female the difference.
+        // This is the safety net for cases where disconnect-recovery undercounted
+        // (e.g., timer was killed early by socket flap, but the call actually
+        // continued on the male's device a few seconds longer).
+        let topupApplied = null;
+        try {
+          const recordedDuration = (existingCallData && existingCallData.durationSeconds) || 0;
+          const clientDuration = Number(client_duration_seconds) || 0;
+          const deltaSeconds = clientDuration - recordedDuration;
+          // Only apply top-up if difference is meaningful (>5s) AND we have all the metadata
+          if (deltaSeconds > 5 && existingCallData && existingCallData.recipientId && existingCallData.callType && db) {
+            const callType = existingCallData.callType;
+            const earningRate = callType === 'video' ? FEMALE_EARNING_RATES.video : FEMALE_EARNING_RATES.audio;
+            const topupAmount = parseFloat((deltaSeconds * earningRate).toFixed(2));
+            const recipientId = existingCallData.recipientId;
+
+            const femaleEarningsRef = db.collection('female_earnings').doc(recipientId);
+            await femaleEarningsRef.set({
+              totalEarnings: admin.firestore.FieldValue.increment(topupAmount),
+              availableBalance: admin.firestore.FieldValue.increment(topupAmount),
+              totalDurationSeconds: admin.firestore.FieldValue.increment(deltaSeconds),
+              lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+
+            const dateKey = new Date().toISOString().split('T')[0];
+            await femaleEarningsRef.collection('daily').doc(dateKey).set({
+              date: dateKey,
+              earnings: admin.firestore.FieldValue.increment(topupAmount),
+              durationSeconds: admin.firestore.FieldValue.increment(deltaSeconds),
+              lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+
+            // Idempotent: same callId-based topup transaction doc — re-running merges, doesn't duplicate.
+            await femaleEarningsRef.collection('transactions').doc(`${finalCallId}__topup`).set({
+              type: 'call_earning_topup',
+              callId: finalCallId,
+              callType,
+              additionalDurationSeconds: deltaSeconds,
+              amount: topupAmount,
+              currency: 'INR',
+              ratePerSecond: earningRate,
+              completedAt: new Date().toISOString(),
+              createdAt: admin.firestore.FieldValue.serverTimestamp(),
+              status: 'completed',
+              reason: 'late_client_report_after_disconnect_recovery',
+            }, { merge: true });
+
+            topupApplied = { deltaSeconds, topupAmount, recipientId };
+            logger.info(`Topup applied for ${finalCallId}: female ${recipientId} credited Rs.${topupAmount} for ${deltaSeconds}s additional (client ${clientDuration}s vs recorded ${recordedDuration}s)`);
+          }
+        } catch (topupErr) {
+          logger.warn(`Top-up check/apply failed for ${finalCallId}: ${topupErr.message}`);
+        }
+
         if (db) {
           await db.collection('calls').doc(finalCallId).update({
             status: 'completed', durationSeconds: client_duration_seconds || 0,
@@ -365,6 +425,7 @@ router.post('/complete', async (req, res) => {
             endedAt: new Date().toISOString(),
             endReason: endReason || 'User ended call',
             billingSource: 'client_fallback',
+            ...(topupApplied && { topupApplied }),
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
           }).catch(() => {});
         }
@@ -374,6 +435,7 @@ router.post('/complete', async (req, res) => {
           durationSeconds: client_duration_seconds || 0,
           coinsDeducted: client_coins_deducted || 0,
           newBalance: null, source: 'client_fallback',
+          ...(topupApplied && { topupApplied }),
           warning: 'Server timer not found, used client-reported values'
         });
       }
@@ -386,12 +448,11 @@ router.post('/complete', async (req, res) => {
       });
     }
 
-    // Stop timer
+    // Stop timer (we'll delete it after billing — duration was captured into timer.durationSeconds by the interval ticks)
     clearInterval(serverTimer.interval);
     const serverDuration = serverTimer.durationSeconds;
-    const coinsDeducted = Math.ceil(serverDuration * serverTimer.coinRate);
 
-    // Fraud detection
+    // Fraud detection — preserved for audit on the call doc
     let fraudDetection = null;
     if (client_duration_seconds !== undefined) {
       const durationDiff = Math.abs(serverDuration - client_duration_seconds);
@@ -405,191 +466,41 @@ router.post('/complete', async (req, res) => {
       }
     }
 
-    // db already declared earlier (idempotency check)
     const effectiveCallerId = finalCallerId || serverTimer.callerId;
     const effectiveRecipientId = finalRecipientId || serverTimer.recipientId;
 
-    // Deduct coins (with negative balance guard)
-    let actualDeduction = coinsDeducted;
-    if (effectiveCallerId && coinsDeducted > 0) {
-      const userRef = db.collection('users').doc(effectiveCallerId);
-      const userDoc = await userRef.get();
-      const data = userDoc.data() || {};
-      const currentBalance = data.coins ?? 0;
-
-      // Guard: don't deduct more than available
-      actualDeduction = Math.min(coinsDeducted, Math.max(0, currentBalance));
-
-      if (actualDeduction > 0) {
-        await userRef.update({
-          coins: admin.firestore.FieldValue.increment(-actualDeduction),
-          lastSpendAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-      }
-
-      if (actualDeduction < coinsDeducted) {
-        logger.warn(`Balance guard: User ${effectiveCallerId} had ${currentBalance} coins, tried to deduct ${coinsDeducted}, deducted ${actualDeduction}`);
-      }
-    }
-
-    const newBalance = await (async () => {
-      const doc = await db.collection('users').doc(effectiveCallerId || serverTimer.callerId).get();
-      const d = doc.data() || {};
-      return d.coins ?? 0;
-    })();
-
-    // Update call in Firestore
-    await db.collection('calls').doc(finalCallId).update({
-      status: 'completed', durationSeconds: serverDuration, coinsDeducted: actualDeduction,
-      endedAt: new Date().toISOString(),
-      endReason: endReason || 'User ended call',
-      billingSource: 'server', fraudDetection,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
-    }).catch(() => {});
-
-    // Record female earnings
-    if (effectiveRecipientId && serverDuration > 0) {
-      try {
-        const earningRate = serverTimer.callType === 'video' ? FEMALE_EARNING_RATES.video : FEMALE_EARNING_RATES.audio;
-        const earningAmount = parseFloat((serverDuration * earningRate).toFixed(2));
-        const dateKey = new Date().toISOString().split('T')[0];
-
-        const femaleEarningsRef = db.collection('female_earnings').doc(effectiveRecipientId);
-        await femaleEarningsRef.set({
-          totalEarnings: admin.firestore.FieldValue.increment(earningAmount),
-          availableBalance: admin.firestore.FieldValue.increment(earningAmount),
-          totalCalls: admin.firestore.FieldValue.increment(1),
-          totalDurationSeconds: admin.firestore.FieldValue.increment(serverDuration),
-          [`total${serverTimer.callType === 'video' ? 'Video' : 'Audio'}Calls`]: admin.firestore.FieldValue.increment(1),
-          [`total${serverTimer.callType === 'video' ? 'Video' : 'Audio'}Earnings`]: admin.firestore.FieldValue.increment(earningAmount),
-          lastCallAt: admin.firestore.FieldValue.serverTimestamp(),
-          lastUpdated: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
-
-        await femaleEarningsRef.collection('daily').doc(dateKey).set({
-          date: dateKey,
-          earnings: admin.firestore.FieldValue.increment(earningAmount),
-          calls: admin.firestore.FieldValue.increment(1),
-          durationSeconds: admin.firestore.FieldValue.increment(serverDuration),
-          lastUpdated: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
-
-        // Record individual transaction for female earnings history
-        const femaleTransactionRef = femaleEarningsRef.collection('transactions').doc(finalCallId);
-        await femaleTransactionRef.set({
-          type: 'call_earning',
-          callId: finalCallId,
-          callerId: serverTimer.callerId,
-          callerName: serverTimer.callerName || 'Unknown',
-          callType: serverTimer.callType,
-          isVideoCall: serverTimer.callType === 'video',
-          durationSeconds: serverDuration,
-          amount: earningAmount,
-          currency: 'INR',
-          ratePerSecond: earningRate,
-          completedAt: new Date().toISOString(),
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          status: 'completed'
-        });
-      } catch (err) {
-        logger.error(`Failed to record female earnings: ${err.message}`);
-      }
-    }
-
-    // Record spend transaction
-    if (effectiveCallerId && actualDeduction > 0) {
-      try {
-        const spendTxnId = `txn_call_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`;
-        const spendTxnData = {
-          id: spendTxnId, userId: effectiveCallerId, type: 'spend', status: 'success',
-          coinAmount: actualDeduction,
-          description: `${serverTimer.callType} call - ${serverDuration}s`,
-          createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
-          metadata: {
-            callId: finalCallId, callType: serverTimer.callType,
-            durationSeconds: serverDuration, coinRate: serverTimer.coinRate,
-            recipientId: effectiveRecipientId
-          }
-        };
-
-        const batch = db.batch();
-        batch.set(db.collection('users').doc(effectiveCallerId).collection('transactions').doc(spendTxnId), spendTxnData);
-        batch.update(db.collection('users').doc(effectiveCallerId), {
-          totalCoinsSpent: admin.firestore.FieldValue.increment(actualDeduction)
-        });
-        await batch.commit();
-      } catch (err) {
-        logger.error(`Failed to record spend transaction: ${err.message}`);
-      }
-    }
-
-    // Update admin analytics
-    try {
-      await db.collection('admin_analytics').doc('call_stats').set({
-        totalCalls: admin.firestore.FieldValue.increment(1),
-        totalDurationSeconds: admin.firestore.FieldValue.increment(serverDuration),
-        totalCoinsDeducted: admin.firestore.FieldValue.increment(actualDeduction),
-        lastUpdated: admin.firestore.FieldValue.serverTimestamp()
-      }, { merge: true });
-    } catch (err) {
-      logger.warn('Call analytics update failed:', err.message);
-    }
-
-    // Update call logs for both users (so frontend call history shows correctly)
-    await updateCallLogs({
+    // Delegate to single-source-of-truth billing helper.
+    // Same function used by server_auto_end and (now) disconnect_recovery —
+    // ensures female earnings are calculated identically regardless of how
+    // the call ended.
+    const io = req.app.get('io');
+    const billingResult = await performCallBilling({
       callId: finalCallId,
-      callerId: serverTimer.callerId,
-      recipientId: effectiveRecipientId,
-      callType: serverTimer.callType,
-      durationSeconds: serverDuration,
-      coinsDeducted: actualDeduction,
-      status: 'completed',
-      endReason: endReason || 'completed',
+      timer: { ...serverTimer, callerId: effectiveCallerId, recipientId: effectiveRecipientId },
+      endReason: endReason || 'User ended call',
       source: 'normal_completion',
+      db,
+      io,
+      endedBy: effectiveCallerId,
+      fraudDetection,
     });
 
     deleteCallTimer(finalCallId);
 
-    // Reset user statuses
+    // Reset user statuses (kept outside billing helper — different paths reset differently)
     setUserStatus(serverTimer.callerId, { status: 'available', currentCallId: null, lastStatusChange: new Date() });
     setUserStatus(serverTimer.recipientId, { status: 'available', currentCallId: null, lastStatusChange: new Date() });
 
-    // Notify participants that call ended
-    const io = req.app.get('io');
-    if (io) {
-      // Calculate female earning for the event payload
-      const earningRate = serverTimer.callType === 'video' ? FEMALE_EARNING_RATES.video : FEMALE_EARNING_RATES.audio;
-      const femaleEarningAmount = parseFloat((serverDuration * earningRate).toFixed(2));
-
-      [serverTimer.callerId, serverTimer.recipientId].forEach(uid => {
-        const conn = getConnectedUser(uid);
-        if (conn && conn.isOnline) {
-          const eventData = {
-            callId: finalCallId,
-            durationSeconds: serverDuration,
-            coinsDeducted: actualDeduction,
-            endReason: endReason || 'User ended call',
-            callType: serverTimer.callType,
-            timestamp: new Date().toISOString()
-          };
-
-          // Add earning data only for the female (recipient)
-          if (uid === effectiveRecipientId) {
-            eventData.earningAmount = femaleEarningAmount;
-            eventData.isRecipient = true;
-          }
-
-          io.to(conn.socketId).emit('call_ended', eventData);
-        }
-      });
-    }
-
     res.json({
       success: true, callId: finalCallId,
-      durationSeconds: serverDuration, coinsDeducted: actualDeduction,
-      newBalance, coinRate: serverTimer.coinRate,
-      callType: serverTimer.callType, source: 'server',
+      durationSeconds: billingResult.durationSeconds,
+      coinsDeducted: billingResult.actualDeduction,
+      newBalance: billingResult.newBalance,
+      coinRate: serverTimer.coinRate,
+      callType: serverTimer.callType,
+      source: 'server',
       fraudDetection,
+      earningAmount: billingResult.earningAmount,
       message: 'Call completed and billed successfully'
     });
   } catch (error) {
