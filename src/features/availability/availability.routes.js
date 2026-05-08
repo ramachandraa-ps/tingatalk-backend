@@ -2,7 +2,8 @@ import { Router } from 'express';
 import { getFirestore } from '../../config/firebase.js';
 import { logger } from '../../utils/logger.js';
 import {
-  getUserStatus, setUserStatus, getConnectedUser, confirmBackgrounded
+  getUserStatus, setUserStatus, getConnectedUser, confirmBackgrounded,
+  getAllConnectedUsers
 } from '../../socket/state/connectionManager.js';
 import { StatsSyncUtil } from '../../utils/statsSyncUtil.js';
 
@@ -338,11 +339,70 @@ router.get('/get_available_females', async (req, res) => {
     const db = getFirestore();
     const io = req.app.get('io');
 
-    const femalesSnapshot = await db.collection('users')
-      .where('gender', '==', 'female')
-      .where('isVerified', '==', true)
-      .where('isAvailable', '==', true)
-      .get();
+    // GRACEFUL DEGRADATION: try to fetch the canonical list from Firestore,
+    // but if Firestore is throttled (RESOURCE_EXHAUSTED) or otherwise erroring,
+    // fall back to building the list from in-memory connection/status maps.
+    // The fallback returns less-rich data but keeps the male UI populated
+    // instead of going blank — which is what users were complaining about.
+    let femalesSnapshot = null;
+    let firestoreFailed = false;
+    try {
+      femalesSnapshot = await db.collection('users')
+        .where('gender', '==', 'female')
+        .where('isVerified', '==', true)
+        .where('isAvailable', '==', true)
+        .get();
+    } catch (qErr) {
+      logger.warn(`get_available_females: Firestore query failed (${qErr.message}) — falling back to in-memory list`);
+      firestoreFailed = true;
+    }
+
+    // === FALLBACK PATH — Firestore is down/throttled ===
+    if (firestoreFailed) {
+      const fallbackFemales = [];
+      const allConnections = getAllConnectedUsers();
+      for (const [userId, connData] of allConnections.entries()) {
+        if (connData.userType !== 'female') continue;
+        if (!connData.isOnline) continue;
+        const userSocket = io.sockets.sockets.get(connData.socketId);
+        if (!userSocket || !userSocket.connected) continue;
+
+        const userStatusData = getUserStatus(userId);
+        const isBusy = userStatusData && userStatusData.status === 'busy';
+
+        // We don't have profile data without Firestore — return minimal payload.
+        // Frontend already has avatar/name cached for known users; for new ones
+        // it will use defaults until Firestore recovers.
+        fallbackFemales.push({
+          userId,
+          name: 'Unknown',
+          age: 0,
+          photoUrl: '',
+          fullPhotoUrl: '',
+          isOnline: true,
+          isAvailable: true,
+          connectionType: 'socket',
+          reachability: 'websocket',
+          status: isBusy ? 'busy' : 'available',
+          currentCallId: isBusy ? userStatusData.currentCallId : null,
+          rating: 0,
+          totalCalls: 0,
+          totalLikes: 0,
+          relationshipStatus: 'single',
+          degraded: true, // marks as fallback data
+        });
+      }
+      logger.info(`get_available_females: returned ${fallbackFemales.length} from in-memory fallback (Firestore unavailable)`);
+      return res.json({
+        success: true,
+        degraded: true,
+        available_females: fallbackFemales,
+        count: fallbackFemales.length,
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    // === NORMAL PATH — Firestore healthy ===
 
     if (femalesSnapshot.empty) {
       return res.json({
@@ -355,7 +415,8 @@ router.get('/get_available_females', async (req, res) => {
     let statsSync = null;
     try { statsSync = new StatsSyncUtil(db); } catch (e) { /* fallback */ }
 
-    // Batch-fetch female_earnings docs for totalCalls (source of truth)
+    // Batch-fetch female_earnings docs for totalCalls (source of truth).
+    // Already has graceful try/catch — totalCalls falls back to userData if this fails.
     const femaleEarningsMap = {};
     try {
       const earningsPromises = femalesSnapshot.docs.map(doc =>
@@ -461,10 +522,41 @@ router.get('/get_available_females', async (req, res) => {
     if (error.message && error.message.includes('index')) {
       logger.error('MISSING FIRESTORE INDEX: Deploy indexes with: firebase deploy --only firestore:indexes');
     }
-    res.status(500).json({
-      error: 'Failed to fetch available females',
-      details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
-    });
+    // Last-resort in-memory fallback even if something unexpected throws.
+    // Better to return an empty-success than a 500 — frontend will preserve
+    // the previously-shown list rather than wiping it.
+    try {
+      const io = req.app.get('io');
+      const fallbackFemales = [];
+      const allConnections = getAllConnectedUsers();
+      for (const [userId, connData] of allConnections.entries()) {
+        if (connData.userType !== 'female' || !connData.isOnline) continue;
+        const userSocket = io && io.sockets.sockets.get(connData.socketId);
+        if (!userSocket || !userSocket.connected) continue;
+        const userStatusData = getUserStatus(userId);
+        const isBusy = userStatusData && userStatusData.status === 'busy';
+        fallbackFemales.push({
+          userId, name: 'Unknown', age: 0, photoUrl: '', fullPhotoUrl: '',
+          isOnline: true, isAvailable: true,
+          connectionType: 'socket', reachability: 'websocket',
+          status: isBusy ? 'busy' : 'available',
+          currentCallId: isBusy ? userStatusData.currentCallId : null,
+          rating: 0, totalCalls: 0, totalLikes: 0,
+          relationshipStatus: 'single', degraded: true,
+        });
+      }
+      return res.json({
+        success: true, degraded: true,
+        available_females: fallbackFemales, count: fallbackFemales.length,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (fallbackErr) {
+      logger.error(`get_available_females: even fallback failed: ${fallbackErr.message}`);
+      res.status(500).json({
+        error: 'Failed to fetch available females',
+        details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+      });
+    }
   }
 });
 
