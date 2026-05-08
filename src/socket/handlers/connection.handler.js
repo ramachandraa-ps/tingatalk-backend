@@ -31,11 +31,41 @@ export function registerConnectionHandlers(io, socket) {
   });
 
   // Handle availability heartbeat response from backgrounded female app
-  socket.on('availability_heartbeat', (data) => {
+  socket.on('availability_heartbeat', async (data) => {
     const userId = data?.userId || data?.user_id;
     if (!userId) return;
     logger.info(`Availability heartbeat received from ${userId} (app is backgrounded, not force-closed)`);
     confirmBackgrounded(userId);
+
+    // Tell males "she's still callable, just FCM-only now". Without this,
+    // when Tier 1's offline broadcast removed her card, nothing brings it
+    // back during her sustained backgrounded session — male UI stays empty
+    // even though she's still reachable via FCM. The recovery event
+    // re-adds the card by triggering male's _debouncedLoadBrowseDates.
+    try {
+      const userStatus = getUserStatus(userId);
+      if (userStatus && userStatus.status === 'available') {
+        // Look up gender to confirm she's a female (males don't broadcast)
+        const db = getFirestore();
+        if (db) {
+          const userDoc = await db.collection('users').doc(userId).get();
+          if (userDoc.exists && userDoc.data().gender === 'female') {
+            io.to('room_male_browse').emit('availability_recovered', {
+              femaleUserId: userId,
+              isAvailable: true,
+              isOnline: false,
+              reachability: 'fcm_only',
+              reason: 'female_confirmed_backgrounded_via_heartbeat',
+              bypassDedup: true,
+              timestamp: new Date().toISOString()
+            });
+            logger.info(`Sent availability_recovered (FCM-reachable) for ${userId}`);
+          }
+        }
+      }
+    } catch (e) {
+      logger.warn(`availability_heartbeat recovery broadcast failed for ${userId}: ${e.message}`);
+    }
   });
 
   socket.on('join', async (data) => {

@@ -3,7 +3,7 @@ import { getFirestore } from '../../config/firebase.js';
 import { logger } from '../../utils/logger.js';
 import {
   getUserStatus, setUserStatus, getConnectedUser, confirmBackgrounded,
-  getAllConnectedUsers
+  getAllConnectedUsers, wasRecentlyBroadcastOffline, clearRecentOfflineBroadcast
 } from '../../socket/state/connectionManager.js';
 import { StatsSyncUtil } from '../../utils/statsSyncUtil.js';
 
@@ -65,6 +65,7 @@ router.post('/check_availability', async (req, res) => {
     let actualStatus = 'unavailable';
     let currentCallId = null;
     let hasConnection = false;
+    let hasFcmToken = false;
 
     if (recipientConnection && recipientConnection.isOnline) {
       const io = req.app.get('io');
@@ -101,23 +102,51 @@ router.post('/check_availability', async (req, res) => {
       }
     }
 
-    // No socket connection = not available (no FCM fallback)
-    const isAvailable = actualStatus === 'available';
-
-    // Also return the user's toggle preference (survives force-close)
+    // FCM-FALLBACK CHECK: if socket is dead but female has a valid FCM token
+    // AND her in-memory status is 'available' (Tier 1 preserves this), she
+    // IS callable — the call-initiate path will FCM-wake her app, exactly
+    // matching what /api/get_available_females (browse list) shows. This
+    // eliminates the user-visible mismatch where the card was visible but
+    // the call was rejected with "user not available".
     let togglePreference = null;
-    try {
-      const db = getFirestore();
-      if (db) {
-        const userDoc = await db.collection('users').doc(recipient_id).get();
-        if (userDoc.exists) {
-          const data = userDoc.data();
-          togglePreference = data.availabilityPreference !== undefined
-            ? data.availabilityPreference
-            : data.isAvailable;
+    if (!hasConnection) {
+      try {
+        const db = getFirestore();
+        if (db) {
+          const userDoc = await db.collection('users').doc(recipient_id).get();
+          if (userDoc.exists) {
+            const data = userDoc.data();
+            const fcm = data.fcmToken;
+            hasFcmToken = !!(fcm && typeof fcm === 'string' && fcm.length > 0);
+            togglePreference = data.availabilityPreference !== undefined
+              ? data.availabilityPreference
+              : data.isAvailable;
+            // If status was preserved as 'available' by Tier 1 and FCM works,
+            // honor that — call routing will wake her via push.
+            if (hasFcmToken && recipientStatus && recipientStatus.status === 'available') {
+              actualStatus = 'available';
+              currentCallId = recipientStatus.currentCallId || null;
+            }
+          }
         }
-      }
-    } catch (_) {}
+      } catch (_) {}
+    } else {
+      // Already had connection — still surface togglePreference for caller UI.
+      try {
+        const db = getFirestore();
+        if (db) {
+          const userDoc = await db.collection('users').doc(recipient_id).get();
+          if (userDoc.exists) {
+            const data = userDoc.data();
+            togglePreference = data.availabilityPreference !== undefined
+              ? data.availabilityPreference
+              : data.isAvailable;
+          }
+        }
+      } catch (_) {}
+    }
+
+    const isAvailable = actualStatus === 'available';
 
     res.json({
       success: true,
@@ -125,6 +154,7 @@ router.post('/check_availability', async (req, res) => {
       user_status: actualStatus,
       availability_preference: togglePreference,
       current_call_id: currentCallId,
+      reachability: hasConnection ? 'websocket' : (hasFcmToken && isAvailable ? 'fcm_only' : 'offline'),
       message: isAvailable ? 'User is available' : `User is currently ${actualStatus}`
     });
   } catch (error) {
@@ -250,9 +280,28 @@ router.post('/update_availability', async (req, res) => {
         io.to('room_male_browse').emit('availability_changed', {
           femaleUserId: user_id,
           isAvailable: is_available,
+          isOnline: true, // toggle-on means her socket is connected (she just acted in the app)
           status: newStatus,
+          reason: 'female_toggled',
           timestamp: new Date().toISOString()
         });
+
+        // Recovery event — fires when toggle-ON happens after an offline
+        // broadcast was sent. Carries bypassDedup so male frontend treats
+        // this as authoritative even if it's close in time to the prior
+        // offline event. Same pattern as the join handler's recovery emit.
+        if (is_available && wasRecentlyBroadcastOffline(user_id)) {
+          io.to('room_male_browse').emit('availability_recovered', {
+            femaleUserId: user_id,
+            isAvailable: true,
+            isOnline: true,
+            reason: 'female_toggled_after_offline_broadcast',
+            bypassDedup: true,
+            timestamp: new Date().toISOString()
+          });
+          clearRecentOfflineBroadcast(user_id);
+          logger.info(`Sent availability_recovered (toggle) for ${user_id}`);
+        }
       }
     } catch (err) {
       logger.error(`Failed to broadcast availability: ${err.message}`);
