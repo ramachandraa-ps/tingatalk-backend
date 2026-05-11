@@ -455,6 +455,23 @@ export function registerCallHandlers(io, socket) {
       } catch (err) {
         logger.error(`Failed to save call to Firestore: ${err.message}`);
       }
+    } else {
+      // Issue B fix (Part 1): timer was created at /api/calls/start (when male
+      // dialed) and has been ticking through the ringing window. Reset its
+      // counter to 0 now that the female has actually accepted, so billing
+      // only counts post-acceptance seconds — not ringing time. Without this,
+      // males get charged (and females get earnings credit) for ringing
+      // seconds, producing the durationSeconds-mismatch pattern between
+      // call doc, earnings transaction, and male spend transaction.
+      const existingTimer = getCallTimer(callId);
+      if (existingTimer) {
+        const ringingSeconds = existingTimer.durationSeconds || 0;
+        existingTimer.durationSeconds = 0;
+        existingTimer.acceptedAt = Date.now();
+        if (ringingSeconds > 0) {
+          logger.info(`Timer reset on accept_call for ${callId} — discarded ${ringingSeconds}s of ringing time`);
+        }
+      }
     }
 
     // Notify caller
