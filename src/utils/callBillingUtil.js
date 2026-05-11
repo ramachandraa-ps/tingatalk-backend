@@ -49,6 +49,23 @@ export async function performCallBilling({ callId, timer, endReason, source, db,
   const coinRate = timer.coinRate;
   const coinsDeducted = Math.ceil(durationSeconds * coinRate);
 
+  // Fix C: resolve callerName when missing/Unknown so female earnings & callLogs
+  // show the actual male name. Recovery paths (disconnect, stale, end_call safety-net)
+  // often pass timers without callerName populated, which previously wrote "Unknown".
+  let resolvedCallerName = timer.callerName;
+  if ((!resolvedCallerName || resolvedCallerName === 'Unknown') && callerId) {
+    try {
+      const cd = await db.collection('users').doc(callerId).get();
+      if (cd.exists) {
+        const d = cd.data() || {};
+        resolvedCallerName = d.name || d.displayName || resolvedCallerName || 'Unknown';
+      }
+    } catch (e) {
+      logger.warn(`performCallBilling: callerName lookup failed for ${callerId}: ${e.message}`);
+    }
+  }
+  resolvedCallerName = resolvedCallerName || 'Unknown';
+
   // 1. Deduct male coins (with balance guard so balance never goes negative)
   let actualDeduction = 0;
   let newBalance = 0;
@@ -141,7 +158,7 @@ export async function performCallBilling({ callId, timer, endReason, source, db,
         type: 'call_earning',
         callId,
         callerId,
-        callerName: timer.callerName || 'Unknown',
+        callerName: resolvedCallerName,
         callType,
         isVideoCall: callType === 'video',
         durationSeconds,
@@ -204,6 +221,7 @@ export async function performCallBilling({ callId, timer, endReason, source, db,
       status: 'completed',
       endReason: endReason || 'completed',
       source,
+      callerName: resolvedCallerName,
     });
   } catch (e) {
     logger.warn(`performCallBilling: callLogs update failed for ${callId}: ${e.message}`);

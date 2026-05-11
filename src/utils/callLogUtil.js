@@ -17,6 +17,7 @@ export async function updateCallLogs({
   status = 'completed',
   endReason = 'completed',
   source = 'server',
+  callerName,
 }) {
   try {
     const db = getFirestore();
@@ -51,12 +52,13 @@ export async function updateCallLogs({
 
     // Update recipient's (female) callLog with earnings
     if (recipientId) {
+      const recipientUpdate = { ...updateData, earnings };
+      // Fix D: write callerName so female call-history & earnings screens
+      // can render the male's actual name instead of "Unknown".
+      if (callerName) recipientUpdate.callerName = callerName;
       writes.push(
         db.collection('users').doc(recipientId).collection('callLogs').doc(callId)
-          .set({
-            ...updateData,
-            earnings,
-          }, { merge: true })
+          .set(recipientUpdate, { merge: true })
       );
     }
 
