@@ -13,6 +13,7 @@ import {
   FEMALE_EARNING_RATES
 } from '../../shared/constants.js';
 import { performCallBilling } from '../../utils/callBillingUtil.js';
+import { getISTDateKey } from '../../utils/dateUtil.js';
 
 const router = Router();
 
@@ -388,7 +389,9 @@ router.post('/complete', async (req, res) => {
               lastUpdated: admin.firestore.FieldValue.serverTimestamp()
             }, { merge: true });
 
-            const dateKey = new Date().toISOString().split('T')[0];
+            // IST dateKey — same rationale as in performCallBilling. Aligns
+            // top-up bucket with frontend's IST "today" view.
+            const dateKey = getISTDateKey();
             await femaleEarningsRef.collection('daily').doc(dateKey).set({
               date: dateKey,
               earnings: admin.firestore.FieldValue.increment(topupAmount),

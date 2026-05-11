@@ -15,6 +15,7 @@ import { logger } from './logger.js';
 import { FEMALE_EARNING_RATES } from '../shared/constants.js';
 import { getConnectedUser } from '../socket/state/connectionManager.js';
 import { updateCallLogs } from './callLogUtil.js';
+import { getISTDateKey } from './dateUtil.js';
 
 /**
  * Run the full end-of-call billing sequence:
@@ -111,7 +112,10 @@ export async function performCallBilling({ callId, timer, endReason, source, db,
   const earningAmount = parseFloat((durationSeconds * earningRate).toFixed(2));
   if (recipientId && durationSeconds > 0) {
     try {
-      const dateKey = new Date().toISOString().split('T')[0];
+      // IST dateKey so per-day bucket aligns with frontend's "today" view.
+      // Calls between IST 12 AM and IST 5:30 AM no longer leak into yesterday's
+      // UTC bucket — which was causing "today earnings = 0" for early-morning callers.
+      const dateKey = getISTDateKey();
       const femaleEarningsRef = db.collection('female_earnings').doc(recipientId);
 
       await femaleEarningsRef.set({
