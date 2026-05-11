@@ -550,12 +550,60 @@ export function registerCallHandlers(io, socket) {
     call.endedAt = new Date();
     call.endedBy = userId;
 
-    // Stop server timer
+    // Stop server timer (we still need duration BEFORE clearing the interval).
     const serverTimer = getCallTimer(callId);
     if (serverTimer) {
       clearInterval(serverTimer.interval);
       logger.info(`Stopped server timer for call ${callId}: ${serverTimer.durationSeconds}s`);
     }
+
+    // ===== SAFETY-NET BILLING (Fix A) =====
+    // The frontend's clean_call_screen.dart is supposed to call
+    // /api/calls/complete BEFORE emitting end_call socket. But in 9% of recent
+    // production calls (15 of 174 over 3 days), end_call socket arrived
+    // WITHOUT a matching /api/calls/complete — leaving status='completed',
+    // coinsDeducted=0, no billingSource. Female under-credited, male got free.
+    //
+    // Fix: when end_call socket arrives, check if billing already ran (via
+    // call doc's billingSource). If NOT, run performCallBilling here as the
+    // safety net. Idempotent — if /api/calls/complete already billed, the
+    // billingSource check below short-circuits and we skip.
+    const dbForBilling = getFirestore();
+    const ALREADY_BILLED = new Set([
+      'server', 'normal_completion', 'server_auto_end', 'disconnect_recovery', 'stale_call_recovery'
+    ]);
+    let alreadyBilled = false;
+    if (dbForBilling) {
+      try {
+        const callDoc = await dbForBilling.collection('calls').doc(callId).get();
+        if (callDoc.exists) {
+          const data = callDoc.data();
+          if (ALREADY_BILLED.has(data.billingSource)) alreadyBilled = true;
+        }
+      } catch (e) {
+        logger.warn(`end_call billing-source check failed for ${callId}: ${e.message}`);
+      }
+    }
+
+    if (!alreadyBilled && serverTimer && (serverTimer.durationSeconds || 0) > 0 && dbForBilling) {
+      logger.warn(`end_call SAFETY-NET BILLING firing for ${callId} — frontend never called /api/calls/complete`);
+      try {
+        await performCallBilling({
+          callId,
+          timer: serverTimer,
+          endReason: 'user_ended',
+          source: 'normal_completion',
+          db: dbForBilling,
+          io,
+          endedBy: userId,
+        });
+      } catch (billErr) {
+        logger.error(`end_call safety-net billing failed for ${callId}: ${billErr.message}`);
+      }
+    } else if (alreadyBilled) {
+      logger.info(`end_call: ${callId} already billed — skipping safety-net (idempotent)`);
+    }
+    // ===== END SAFETY-NET BILLING =====
 
     // Reset all participants
     if (call.participants) {
