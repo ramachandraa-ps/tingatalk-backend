@@ -133,28 +133,32 @@ router.post('/reserve-user', async (req, res) => {
     const phoneIndexRef = db.collection('phone_index').doc(cleaned);
 
     const result = await db.runTransaction(async (tx) => {
-      // Step 1: check phone_index (fast path for already-reserved phones)
+      // Step 1: check phone_index (fast path for already-reserved phones).
+      // The reservation is authoritative — if phone_index exists, return that
+      // userId whether or not the users/{userId} doc has been created yet.
+      // (Client may have crashed between reserve and createUserDocument; on
+      // retry we must return the SAME userId.)
       const indexDoc = await tx.get(phoneIndexRef);
       if (indexDoc.exists) {
         const existingUserId = indexDoc.data().userId;
         const existingUserSnap = await tx.get(db.collection('users').doc(existingUserId));
-        if (existingUserSnap.exists) {
-          const u = existingUserSnap.data();
-          return {
+        const userDocExists = existingUserSnap.exists;
+        const u = userDocExists ? existingUserSnap.data() : null;
+        return {
+          userId: existingUserId,
+          // isExisting=true ONLY if the user doc was already created — so client
+          // knows whether to skip createUserDocument or proceed with it.
+          isExisting: userDocExists,
+          source: userDocExists ? 'phone_index' : 'phone_index_pending_doc',
+          user: u ? {
             userId: existingUserId,
-            isExisting: true,
-            source: 'phone_index',
-            user: {
-              userId: existingUserId,
-              name: u.name || u.displayName || null,
-              gender: u.gender || null,
-              isVerified: u.isVerified || false,
-              onboardingCompleted: u.onboardingCompleted || false,
-              profileImageUrl: u.profileImageUrl || u.profilePhotoUrl || null,
-            },
-          };
-        }
-        // Index points to a missing user doc — treat as orphan and overwrite below.
+            name: u.name || u.displayName || null,
+            gender: u.gender || null,
+            isVerified: u.isVerified || false,
+            onboardingCompleted: u.onboardingCompleted || false,
+            profileImageUrl: u.profileImageUrl || u.profilePhotoUrl || null,
+          } : null,
+        };
       }
 
       // Step 2: fallback scan of users collection (for legacy users without phone_index entry)
