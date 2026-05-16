@@ -18,6 +18,38 @@ import { startMarketingNotificationJob, stopMarketingNotificationJob } from './f
 
 let heartbeatIntervalId = null;
 let memoryCheckIntervalId = null;
+let staleCallReaperIntervalId = null;
+
+// Idempotency signals for billing — used by heartbeat-stale-detection and the
+// stale-call reaper to avoid re-billing calls another path already handled.
+//
+// MUST stay in sync with ALREADY_BILLED in call.handler.js end_call handler.
+// Verified against every performCallBilling() caller in the codebase:
+//   - 'server'              legacy value still present on older call docs
+//   - 'normal_completion'   end_call socket safety-net + /api/calls/complete
+//   - 'server_auto_end'     auto-end timer when male balance exhausted
+//   - 'disconnect_recovery' connection.handler.js disconnect path
+//   - 'client_fallback'     calls.routes.js fallback billing path
+//   - 'stale_call_recovery' this file's heartbeat-stale-detection path
+//   - 'admin_cleanup_2026-05-16' one-off cleanup script
+const BILLED_SOURCES = new Set([
+  'server',
+  'normal_completion',
+  'server_auto_end',
+  'disconnect_recovery',
+  'client_fallback',
+  'stale_call_recovery',
+  'admin_cleanup_2026-05-16',
+]);
+
+// Defense-in-depth: status-based check. Extended from the original 7 statuses
+// with 'disconnected' (Bug C original symptom), 'abandoned' (cleanup script),
+// 'missed' (used elsewhere in codebase).
+const TERMINAL_STATUSES = [
+  'cancelled', 'declined', 'ended', 'completed',
+  'timeout', 'timeout_heartbeat', 'timeout_runaway',
+  'disconnected', 'abandoned', 'missed',
+];
 
 // ============================================================================
 // Heartbeat Timeout Monitor
@@ -74,8 +106,14 @@ function startHeartbeatMonitor(io) {
             if (callDoc.exists) {
               const callData = callDoc.data();
               const callStatus = callData.status;
-              if (['cancelled', 'declined', 'ended', 'completed', 'timeout', 'timeout_heartbeat', 'timeout_runaway'].includes(callStatus)) {
-                logger.info(`Skipping stale billing for ${callId} — already ${callStatus} in Firestore`);
+              const billingSource = callData.billingSource;
+              // Bug C fix: use billingSource as PRIMARY signal (correct dimension —
+              // means "billing has run") with status as defense-in-depth secondary.
+              // Either signal indicating "already handled" → skip.
+              const alreadyBilled = (billingSource && BILLED_SOURCES.has(billingSource)) ||
+                                    TERMINAL_STATUSES.includes(callStatus);
+              if (alreadyBilled) {
+                logger.info(`Skipping stale billing for ${callId} — already handled (status=${callStatus}, billingSource=${billingSource || 'none'})`);
                 deleteCallTimer(callId);
                 deleteActiveCall(callId);
                 await removeCallTimerFromRedis(callId);
@@ -269,11 +307,94 @@ function startStaleConnectionCleanup(io) {
   }, 300000); // Every 5 minutes
 }
 
+// ============================================================================
+// STALE CALL REAPER — observability only (v1)
+// ============================================================================
+// Detects calls stuck in non-terminal Firestore states for >2 hours.
+// 2h threshold is well above the 60-min hard call cap (HEARTBEAT_TIMEOUT_MS
+// + MAX_CALL_DURATION_SECONDS), so legitimate calls can never trigger.
+//
+// v1 = OBSERVABILITY-ONLY: only logs warnings. Does NOT mutate Firestore.
+// After 1 week of zero false positives in production, flip
+// STALE_CALL_REAPER_AUTOCLEAN to true for self-healing cleanup (out of
+// scope for this commit).
+//
+// Requires composite index calls(status, createdAt) deployed via
+// firestore.indexes.json in the same PR (Task 4a). If the index isn't
+// built yet, the FAILED_PRECONDITION handler below logs a clear message.
+const STALE_CALL_REAPER_AUTOCLEAN = false;
+const STALE_CALL_THRESHOLD_MS = 2 * 60 * 60 * 1000;        // 2 hours
+const STALE_CALL_REAPER_INTERVAL_MS = 60 * 60 * 1000;       // 1 hour
+const STALE_CALL_REAPER_NON_TERMINAL = ['initiated', 'ringing', 'accepted', 'active'];
+
+async function staleCallReaperTick() {
+  try {
+    const db = getFirestore();
+    if (!db) return;
+
+    const cutoff = new Date(Date.now() - STALE_CALL_THRESHOLD_MS);
+    const cutoffTs = admin.firestore.Timestamp.fromDate(cutoff);
+
+    let totalFound = 0;
+    const samples = [];
+
+    for (const status of STALE_CALL_REAPER_NON_TERMINAL) {
+      const snap = await db.collection('calls')
+        .where('status', '==', status)
+        .where('createdAt', '<', cutoffTs)
+        .limit(100)
+        .get();
+      snap.forEach(d => {
+        totalFound++;
+        if (samples.length < 5) {
+          const data = d.data();
+          const ageMin = data.createdAt && data.createdAt.toDate
+            ? Math.round((Date.now() - data.createdAt.toDate().getTime()) / 60000)
+            : 'n/a';
+          samples.push({
+            id: d.id,
+            status,
+            ageMin,
+            caller: data.callerId,
+            recipient: data.recipientId,
+          });
+        }
+      });
+    }
+
+    if (totalFound === 0) {
+      logger.info('STALE_CALL_REAPER: clean tick (0 stale calls detected)');
+      return;
+    }
+
+    logger.warn(`STALE_CALL_REAPER: detected ${totalFound} stale call doc(s) (>2h old in non-terminal state). AUTOCLEAN=${STALE_CALL_REAPER_AUTOCLEAN}.`);
+    samples.forEach(s => {
+      logger.warn(`  STALE_CALL: callId=${s.id} status=${s.status} ageMin=${s.ageMin} caller=${s.caller} recipient=${s.recipient}`);
+    });
+
+    if (STALE_CALL_REAPER_AUTOCLEAN) {
+      // Future autoclean branch — intentionally not implemented in v1
+      logger.warn('STALE_CALL_REAPER: AUTOCLEAN enabled but not yet implemented — observability-only mode');
+    }
+  } catch (err) {
+    logger.error(`STALE_CALL_REAPER tick error: ${err.message}`);
+    if (err.code === 9 || /FAILED_PRECONDITION/i.test(err.message)) {
+      logger.error('STALE_CALL_REAPER: Firestore composite index calls(status, createdAt) is missing or still building. Deploy firestore.indexes.json then restart.');
+    }
+  }
+}
+
+function startStaleCallReaper() {
+  staleCallReaperIntervalId = setInterval(staleCallReaperTick, STALE_CALL_REAPER_INTERVAL_MS);
+  logger.info(`STALE_CALL_REAPER: registered (interval ${STALE_CALL_REAPER_INTERVAL_MS / 60000}min, threshold ${STALE_CALL_THRESHOLD_MS / 60000}min, AUTOCLEAN=${STALE_CALL_REAPER_AUTOCLEAN})`);
+}
+
 export function startBackgroundJobs(io) {
   startHeartbeatMonitor(io);
   startMemoryProtection();
   startStaleConnectionCleanup(io);
   startMarketingNotificationJob();
+  startStaleCallReaper();
   logger.info(`Background jobs started (heartbeat timeout: ${HEARTBEAT_TIMEOUT_MS / 1000}s, check interval: ${HEARTBEAT_CHECK_INTERVAL_MS / 1000}s)`);
 }
 
@@ -281,6 +402,7 @@ export function stopBackgroundJobs() {
   if (heartbeatIntervalId) clearInterval(heartbeatIntervalId);
   if (memoryCheckIntervalId) clearInterval(memoryCheckIntervalId);
   if (staleCleanupIntervalId) clearInterval(staleCleanupIntervalId);
+  if (staleCallReaperIntervalId) clearInterval(staleCallReaperIntervalId);
   stopMarketingNotificationJob();
   logger.info('Background jobs stopped');
 }
