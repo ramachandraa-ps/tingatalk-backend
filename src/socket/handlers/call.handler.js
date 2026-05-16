@@ -11,6 +11,34 @@ import {
 import { COIN_RATES, CALL_RING_TIMEOUT_MS, FCM_CALL_TIMEOUT_MS } from '../../shared/constants.js';
 import { performCallBilling } from '../../utils/callBillingUtil.js';
 
+// ============================================================================
+// INITIATE_CALL deduplication (Bug A fix)
+// ============================================================================
+// The Flutter client (clean_call_screen.dart + male_home_screen.dart) fires
+// duplicate INITIATE_CALL events 100-200ms apart for the same caller→recipient
+// pair (tap-debounce bug, separately tracked for next Flutter cycle).
+//
+// Without server-side dedup: first event sets recipient to 'ringing'; second
+// event sees ringing and emits is_busy=true to the caller → Flutter shows
+// "Line Busy" to the user even though no one is actually busy.
+//
+// Fix: keep a per-pair timestamp Map. Silently absorb duplicates within
+// INITIATE_DEDUP_WINDOW_MS. Caller already has the right state from the
+// first event's call_initiated response.
+//
+// Pattern mirrors recentJoinsByUser dedup in connection.handler.js:18,65-82.
+const recentInitiateByPair = new Map(); // key: `${callerId}_${recipientId}`, value: timestamp
+const INITIATE_DEDUP_WINDOW_MS = 3000;
+
+// Periodic cleanup to prevent unbounded growth. Cutoff is 2× the window so
+// stale entries are always removed long after their dedup window expires.
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, ts] of recentInitiateByPair.entries()) {
+    if (now - ts > INITIATE_DEDUP_WINDOW_MS * 2) recentInitiateByPair.delete(key);
+  }
+}, 60000);
+
 // FCM notification helper
 async function sendIncomingCallNotification(userId, callData) {
   const messaging = getMessaging();
@@ -101,6 +129,22 @@ export function registerCallHandlers(io, socket) {
       socket.emit('error', { message: 'Caller ID and Recipient ID are required' });
       return;
     }
+
+    // Bug A fix: dedup duplicate INITIATE_CALL events from same caller→recipient.
+    // Flutter fires duplicates 100-200ms apart; first succeeds and sets recipient
+    // to 'ringing'; the duplicate would emit is_busy='Line Busy' to caller.
+    // Silently ack duplicates — caller already has the right state from event #1.
+    // TODO(flutter): debounce the call button tap in clean_call_screen.dart /
+    // male_home_screen.dart to fix the root cause client-side in next AAB cycle.
+    const pairKey = `${callerId}_${recipientId}`;
+    const lastInitiateTs = recentInitiateByPair.get(pairKey);
+    const nowMs = Date.now();
+    if (lastInitiateTs && (nowMs - lastInitiateTs) < INITIATE_DEDUP_WINDOW_MS) {
+      logger.info(`INITIATE_CALL deduped: ${callerId}→${recipientId} within ${nowMs - lastInitiateTs}ms of prior`);
+      // Silently ack — caller already has call_initiated event from the first.
+      return;
+    }
+    recentInitiateByPair.set(pairKey, nowMs);
 
     // STEP 0: Check if caller already has an active/pending call (prevent duplicates)
     const callerStatus = getUserStatus(callerId);
@@ -586,8 +630,10 @@ export function registerCallHandlers(io, socket) {
     // safety net. Idempotent — if /api/calls/complete already billed, the
     // billingSource check below short-circuits and we skip.
     const dbForBilling = getFirestore();
+    // MUST stay in sync with BILLED_SOURCES in backgroundJobs.js (Bug C fix).
     const ALREADY_BILLED = new Set([
-      'server', 'normal_completion', 'server_auto_end', 'disconnect_recovery', 'stale_call_recovery'
+      'server', 'normal_completion', 'server_auto_end', 'disconnect_recovery',
+      'stale_call_recovery', 'client_fallback', 'admin_cleanup_2026-05-16',
     ]);
     let alreadyBilled = false;
     if (dbForBilling) {

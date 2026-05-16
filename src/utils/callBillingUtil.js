@@ -170,6 +170,12 @@ export async function performCallBilling({ callId, timer, endReason, source, db,
         status: 'completed',
         source, // audit: which billing path produced this earning
       });
+
+      // Bug B observability: single grep-able line per successful female-earnings
+      // credit. Replaces the prior "had to query Firestore to know if credit
+      // happened" investigation workflow. Format covers both sides of the txn
+      // (male deduction + female credit) in one place.
+      logger.info(`BILLING_WRITE: callId=${callId} recipientId=${recipientId} earningAmount=${earningAmount} callType=${callType} durationSeconds=${durationSeconds} actualDeduction=${actualDeduction} source=${source}`);
     } catch (e) {
       logger.error(`performCallBilling: female earnings failed for ${callId}: ${e.message}`);
     }
