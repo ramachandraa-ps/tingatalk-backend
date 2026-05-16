@@ -19,6 +19,37 @@ import { startMarketingNotificationJob, stopMarketingNotificationJob } from './f
 let heartbeatIntervalId = null;
 let memoryCheckIntervalId = null;
 
+// Idempotency signals for billing — used by heartbeat-stale-detection and the
+// stale-call reaper to avoid re-billing calls another path already handled.
+//
+// MUST stay in sync with ALREADY_BILLED in call.handler.js end_call handler.
+// Verified against every performCallBilling() caller in the codebase:
+//   - 'server'              legacy value still present on older call docs
+//   - 'normal_completion'   end_call socket safety-net + /api/calls/complete
+//   - 'server_auto_end'     auto-end timer when male balance exhausted
+//   - 'disconnect_recovery' connection.handler.js disconnect path
+//   - 'client_fallback'     calls.routes.js fallback billing path
+//   - 'stale_call_recovery' this file's heartbeat-stale-detection path
+//   - 'admin_cleanup_2026-05-16' one-off cleanup script
+const BILLED_SOURCES = new Set([
+  'server',
+  'normal_completion',
+  'server_auto_end',
+  'disconnect_recovery',
+  'client_fallback',
+  'stale_call_recovery',
+  'admin_cleanup_2026-05-16',
+]);
+
+// Defense-in-depth: status-based check. Extended from the original 7 statuses
+// with 'disconnected' (Bug C original symptom), 'abandoned' (cleanup script),
+// 'missed' (used elsewhere in codebase).
+const TERMINAL_STATUSES = [
+  'cancelled', 'declined', 'ended', 'completed',
+  'timeout', 'timeout_heartbeat', 'timeout_runaway',
+  'disconnected', 'abandoned', 'missed',
+];
+
 // ============================================================================
 // Heartbeat Timeout Monitor
 // ============================================================================
@@ -74,8 +105,14 @@ function startHeartbeatMonitor(io) {
             if (callDoc.exists) {
               const callData = callDoc.data();
               const callStatus = callData.status;
-              if (['cancelled', 'declined', 'ended', 'completed', 'timeout', 'timeout_heartbeat', 'timeout_runaway'].includes(callStatus)) {
-                logger.info(`Skipping stale billing for ${callId} — already ${callStatus} in Firestore`);
+              const billingSource = callData.billingSource;
+              // Bug C fix: use billingSource as PRIMARY signal (correct dimension —
+              // means "billing has run") with status as defense-in-depth secondary.
+              // Either signal indicating "already handled" → skip.
+              const alreadyBilled = (billingSource && BILLED_SOURCES.has(billingSource)) ||
+                                    TERMINAL_STATUSES.includes(callStatus);
+              if (alreadyBilled) {
+                logger.info(`Skipping stale billing for ${callId} — already handled (status=${callStatus}, billingSource=${billingSource || 'none'})`);
                 deleteCallTimer(callId);
                 deleteActiveCall(callId);
                 await removeCallTimerFromRedis(callId);
