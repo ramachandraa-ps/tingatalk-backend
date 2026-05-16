@@ -630,8 +630,10 @@ export function registerCallHandlers(io, socket) {
     // safety net. Idempotent — if /api/calls/complete already billed, the
     // billingSource check below short-circuits and we skip.
     const dbForBilling = getFirestore();
+    // MUST stay in sync with BILLED_SOURCES in backgroundJobs.js (Bug C fix).
     const ALREADY_BILLED = new Set([
-      'server', 'normal_completion', 'server_auto_end', 'disconnect_recovery', 'stale_call_recovery'
+      'server', 'normal_completion', 'server_auto_end', 'disconnect_recovery',
+      'stale_call_recovery', 'client_fallback', 'admin_cleanup_2026-05-16',
     ]);
     let alreadyBilled = false;
     if (dbForBilling) {
