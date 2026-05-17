@@ -21,6 +21,7 @@ import availabilityRoutes from './features/availability/availability.routes.js';
 import callsRoutes from './features/calls/calls.routes.js';
 import callsStandaloneRoutes from './features/calls/calls.standalone.routes.js';
 import paymentsRoutes from './features/payments/payments.routes.js';
+import paymentsWebhookRoutes from './features/payments/payments.webhook.routes.js';
 import rewardsRoutes from './features/rewards/rewards.routes.js';
 import payoutsRoutes from './features/payouts/payouts.routes.js';
 import statsRoutes from './features/stats/stats.routes.js';
@@ -50,8 +51,13 @@ export function createApp() {
   };
   app.use(cors(corsOptions));
 
-  // Body parsing
-  app.use(express.json({ limit: '10mb' }));
+  // Body parsing — capture raw bytes for Razorpay webhook HMAC verification.
+  // The webhook route reads req.rawBody (literal request bytes) to verify the
+  // HMAC signature; standard parsing into req.body still happens normally.
+  app.use(express.json({
+    limit: '10mb',
+    verify: (req, _res, buf) => { req.rawBody = buf; },
+  }));
   app.use(express.urlencoded({ extended: true }));
 
   // Rate limiting (applied to all API routes)
@@ -68,6 +74,9 @@ export function createApp() {
   app.use('/api', callsStandaloneRoutes);
   // Availability routes (Flutter doesn't send auth headers)
   app.use('/api', availabilityRoutes);
+  // Razorpay webhook — server-to-server, no auth header. Mounted publicly via
+  // separate router so /orders and /verify stay authenticated below.
+  app.use('/api/payments', paymentsWebhookRoutes);
 
   // --- Admin routes (before catch-all /api auth routes) ---
   app.use('/api/diagnostic', diagnosticsRoutes);
