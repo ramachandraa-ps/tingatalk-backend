@@ -19,7 +19,8 @@ export const config = {
   razorpay: {
     keyId: process.env.RAZORPAY_KEY_ID,
     keySecret: process.env.RAZORPAY_KEY_SECRET,
-    accountNumber: process.env.RAZORPAYX_ACCOUNT_NUMBER || ''
+    accountNumber: process.env.RAZORPAYX_ACCOUNT_NUMBER || '',
+    webhookSecret: process.env.RAZORPAY_WEBHOOK_SECRET || ''
   },
 
   twilio: {
