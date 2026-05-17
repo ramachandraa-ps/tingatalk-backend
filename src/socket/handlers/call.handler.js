@@ -382,11 +382,28 @@ export function registerCallHandlers(io, socket) {
             }
           }, FCM_CALL_TIMEOUT_MS);
         } else {
+          // FCM send failed — terminal state. Must write to Firestore (not just
+          // in-memory) so the call doc doesn't sit 'initiated' forever and get
+          // flagged by STALE_CALL_REAPER. Previously this path leaked.
           call.status = 'failed';
+          completeCall(finalCallId, {
+            status: 'failed',
+            endReason: 'fcm_send_failed',
+            endedAt: new Date(),
+            billingSource: 'recipient_unreachable',
+          });
           socket.emit('call_failed', { callId: finalCallId, reason: 'Could not reach recipient' });
         }
       } else {
+        // Recipient unavailable (no socket + no FCM-toggle/token). Terminal.
+        // Same Firestore-write requirement as above to prevent reaper accumulation.
         call.status = 'failed';
+        completeCall(finalCallId, {
+          status: 'failed',
+          endReason: 'recipient_offline',
+          endedAt: new Date(),
+          billingSource: 'recipient_unreachable',
+        });
         socket.emit('call_failed', { callId: finalCallId, reason: 'Recipient is offline' });
       }
     }
