@@ -349,68 +349,110 @@ const STALE_CALL_AUTO_ABANDON_INTERVAL_MS = 5 * 60 * 1000;  // 5 min
 const STALE_CALL_AUTO_ABANDON_THRESHOLD_MS = 5 * 60 * 1000; // 5 min
 const STALE_CALL_AUTO_ABANDON_STATUSES = ['initiated', 'ringing']; // never 'accepted'/'active'
 
+// 2026-05-17: Tier 1b — catch accepted/active calls left stale by socket-jitter
+// races where late accept_call arrived after cancel/decline (see analysis in
+// project_stale_call_leak_root_cause_fix memory). Stricter rules than Tier 1a:
+//   - 30 min threshold (real calls never legitimately sit accepted/active >30min
+//     without billing — coinsDeducted=0 AND durationSeconds=0 means it never
+//     truly started even though status says otherwise)
+//   - Triple-defensive: skips if ANY billing marker exists. A real call would
+//     have coinsDeducted>0 OR durationSeconds>0 within seconds of going active.
+//   - Layer 1 (accept_call order-guard) should eliminate the source; this is
+//     defense-in-depth for any cases that slip through.
+const STALE_ACCEPTED_AUTO_ABANDON_THRESHOLD_MS = 30 * 60 * 1000; // 30 min
+const STALE_ACCEPTED_AUTO_ABANDON_STATUSES = ['accepted', 'active'];
+
 const STALE_CALL_REAPER_NON_TERMINAL = ['initiated', 'ringing', 'accepted', 'active'];
 
 let staleCallAutoAbandonIntervalId = null;
 
+/**
+ * Internal helper used by both the 5min initiated/ringing reaper and the
+ * 30min accepted/active reaper. Returns { abandoned: number, samples: [] }.
+ *
+ * @param {string[]} statuses        - non-terminal statuses to scan
+ * @param {number}   thresholdMs     - how old the call must be (ms)
+ * @param {string}   logPrefix       - identifies which tier in logs
+ */
+async function autoAbandonScan(statuses, thresholdMs, logPrefix) {
+  const db = getFirestore();
+  if (!db) return { abandoned: 0, samples: [] };
+
+  const cutoff = new Date(Date.now() - thresholdMs);
+  const cutoffTs = admin.firestore.Timestamp.fromDate(cutoff);
+
+  let totalAbandoned = 0;
+  const samples = [];
+
+  for (const status of statuses) {
+    const snap = await db.collection('calls')
+      .where('status', '==', status)
+      .where('createdAt', '<', cutoffTs)
+      .limit(100)
+      .get();
+
+    const safeDocs = [];
+    snap.forEach(d => {
+      const data = d.data();
+      // Triple-defensive: any billing marker means the call did real work
+      // (or another path already handled it). Never auto-abandon those.
+      const hasBilling = (data.coinsDeducted || 0) > 0
+                      || (data.durationSeconds || 0) > 0
+                      || (data.billingSource && BILLED_SOURCES.has(data.billingSource));
+      if (hasBilling) {
+        logger.warn(`${logPrefix} skipping ${d.id} — has billing markers despite status=${status}`);
+        return;
+      }
+      safeDocs.push({ ref: d.ref, id: d.id, callerId: data.callerId, recipientId: data.recipientId });
+    });
+
+    if (safeDocs.length > 0) {
+      const batch = db.batch();
+      const now = new Date();
+      for (const doc of safeDocs) {
+        batch.update(doc.ref, {
+          status: 'abandoned',
+          previousStatus: status,
+          endedAt: now,
+          endReason: 'auto_abandon_no_response',
+          billingSource: 'reaper_auto_abandon',
+          cleanedAt: now,
+        });
+        totalAbandoned++;
+        if (samples.length < 5) {
+          samples.push({ id: doc.id, status, caller: doc.callerId, recipient: doc.recipientId });
+        }
+      }
+      await batch.commit();
+    }
+  }
+  return { abandoned: totalAbandoned, samples };
+}
+
 async function staleCallAutoAbandonTick() {
   try {
-    const db = getFirestore();
-    if (!db) return;
-
-    const cutoff = new Date(Date.now() - STALE_CALL_AUTO_ABANDON_THRESHOLD_MS);
-    const cutoffTs = admin.firestore.Timestamp.fromDate(cutoff);
-
-    let totalAbandoned = 0;
-    const abandonedSamples = [];
-
-    for (const status of STALE_CALL_AUTO_ABANDON_STATUSES) {
-      const snap = await db.collection('calls')
-        .where('status', '==', status)
-        .where('createdAt', '<', cutoffTs)
-        .limit(100)
-        .get();
-
-      // Defensive: never auto-abandon a call that has any billing markers,
-      // even if status is 'initiated'/'ringing'. Belt and suspenders.
-      const safeDocs = [];
-      snap.forEach(d => {
-        const data = d.data();
-        const hasBilling = (data.coinsDeducted || 0) > 0
-                        || (data.durationSeconds || 0) > 0
-                        || (data.billingSource && BILLED_SOURCES.has(data.billingSource));
-        if (hasBilling) {
-          logger.warn(`AUTO_ABANDON skipping ${d.id} — has billing markers despite status=${status}`);
-          return;
-        }
-        safeDocs.push({ ref: d.ref, id: d.id, callerId: data.callerId, recipientId: data.recipientId, callType: data.callType });
+    // Tier 1a: initiated/ringing > 5 min (catches caller-abandoned dial attempts)
+    const tier1a = await autoAbandonScan(
+      STALE_CALL_AUTO_ABANDON_STATUSES,
+      STALE_CALL_AUTO_ABANDON_THRESHOLD_MS,
+      'AUTO_ABANDON_RINGING'
+    );
+    if (tier1a.abandoned > 0) {
+      logger.warn(`STALE_CALL_AUTO_ABANDON: marked ${tier1a.abandoned} initiated/ringing call(s) as 'abandoned' (>5min, never reached active)`);
+      tier1a.samples.forEach(s => {
+        logger.info(`  ABANDONED: callId=${s.id} previousStatus=${s.status} caller=${s.caller} recipient=${s.recipient}`);
       });
-
-      // Batch update — Firestore caps at 500 per batch; 100 limit per query is safe.
-      if (safeDocs.length > 0) {
-        const batch = db.batch();
-        const now = new Date();
-        for (const doc of safeDocs) {
-          batch.update(doc.ref, {
-            status: 'abandoned',
-            previousStatus: status,
-            endedAt: now,
-            endReason: 'auto_abandon_no_response',
-            billingSource: 'reaper_auto_abandon',
-            cleanedAt: now,
-          });
-          totalAbandoned++;
-          if (abandonedSamples.length < 5) {
-            abandonedSamples.push({ id: doc.id, status, caller: doc.callerId, recipient: doc.recipientId });
-          }
-        }
-        await batch.commit();
-      }
     }
 
-    if (totalAbandoned > 0) {
-      logger.warn(`STALE_CALL_AUTO_ABANDON: marked ${totalAbandoned} call(s) as 'abandoned' (>5min old, never reached active)`);
-      abandonedSamples.forEach(s => {
+    // Tier 1b: accepted/active > 30 min with NO billing (race-condition leak)
+    const tier1b = await autoAbandonScan(
+      STALE_ACCEPTED_AUTO_ABANDON_STATUSES,
+      STALE_ACCEPTED_AUTO_ABANDON_THRESHOLD_MS,
+      'AUTO_ABANDON_ACCEPTED'
+    );
+    if (tier1b.abandoned > 0) {
+      logger.warn(`STALE_ACCEPTED_AUTO_ABANDON: marked ${tier1b.abandoned} accepted/active call(s) as 'abandoned' (>30min, zero billing markers — race-condition leak)`);
+      tier1b.samples.forEach(s => {
         logger.info(`  ABANDONED: callId=${s.id} previousStatus=${s.status} caller=${s.caller} recipient=${s.recipient}`);
       });
     }
@@ -478,7 +520,7 @@ function startStaleCallReaper() {
   staleCallReaperIntervalId = setInterval(staleCallReaperTick, STALE_CALL_REAPER_INTERVAL_MS);
   staleCallAutoAbandonIntervalId = setInterval(staleCallAutoAbandonTick, STALE_CALL_AUTO_ABANDON_INTERVAL_MS);
   logger.info(`STALE_CALL_REAPER: registered (observability tier: interval ${STALE_CALL_REAPER_INTERVAL_MS / 60000}min threshold ${STALE_CALL_THRESHOLD_MS / 60000}min)`);
-  logger.info(`STALE_CALL_AUTO_ABANDON: registered (auto-abandon tier: interval ${STALE_CALL_AUTO_ABANDON_INTERVAL_MS / 60000}min threshold ${STALE_CALL_AUTO_ABANDON_THRESHOLD_MS / 60000}min statuses=${STALE_CALL_AUTO_ABANDON_STATUSES.join(',')})`);
+  logger.info(`STALE_CALL_AUTO_ABANDON: registered (interval ${STALE_CALL_AUTO_ABANDON_INTERVAL_MS / 60000}min, tier 1a: initiated/ringing >${STALE_CALL_AUTO_ABANDON_THRESHOLD_MS / 60000}min, tier 1b: accepted/active >${STALE_ACCEPTED_AUTO_ABANDON_THRESHOLD_MS / 60000}min with zero-billing-only)`);
 }
 
 export function startBackgroundJobs(io) {

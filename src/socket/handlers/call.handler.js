@@ -39,6 +39,27 @@ setInterval(() => {
   }
 }, 60000);
 
+// ============================================================================
+// Idempotency signals for call-state transitions
+// ============================================================================
+// MUST stay in sync with BILLED_SOURCES in backgroundJobs.js. Used by accept_call
+// and start_call (and end_call's pre-existing safety-net) to detect when a late
+// socket event arrived after the call already reached a terminal state.
+//
+// Why module scope: previously inlined inside end_call handler. Hoisted here so
+// accept_call, start_call, end_call all share one source of truth.
+const ALREADY_BILLED = new Set([
+  'server', 'normal_completion', 'server_auto_end', 'disconnect_recovery',
+  'stale_call_recovery', 'client_fallback', 'admin_cleanup_2026-05-16',
+  'recipient_unreachable', 'reaper_auto_abandon',
+]);
+
+const TERMINAL_CALL_STATUSES = [
+  'cancelled', 'declined', 'ended', 'completed',
+  'timeout', 'timeout_heartbeat', 'timeout_runaway',
+  'disconnected', 'abandoned', 'missed', 'failed',
+];
+
 // FCM notification helper
 async function sendIncomingCallNotification(userId, callData) {
   const messaging = getMessaging();
@@ -426,6 +447,38 @@ export function registerCallHandlers(io, socket) {
       return;
     }
 
+    // Order-guard (2026-05-17): if the call is ALREADY in a terminal state in
+    // Firestore (cancelled, declined, ended, completed, etc.), this accept_call
+    // event arrived late — likely due to socket jitter that delivered it after
+    // cancel_call/decline_call. Silently ignore: never resurrect a finished call.
+    //
+    // Witnessed pattern that motivated this guard:
+    //   16:41:12 — female disconnected
+    //   16:41:22 — Firestore status='ended'
+    //   16:41:23 — late accept_call arrived → overwrote to 'accepted', leaving
+    //              call stuck in 'accepted' forever.
+    try {
+      const db = getFirestore();
+      if (db) {
+        const callDoc = await db.collection('calls').doc(callId).get();
+        if (callDoc.exists) {
+          const callData = callDoc.data();
+          const callStatus = callData.status;
+          const billingSource = callData.billingSource;
+          // ALREADY_BILLED kept in sync with backgroundJobs.js BILLED_SOURCES.
+          // Either signal indicates "terminal" → late accept is a no-op.
+          const alreadyTerminal = ALREADY_BILLED.has(billingSource) ||
+                                  TERMINAL_CALL_STATUSES.includes(callStatus);
+          if (alreadyTerminal) {
+            logger.warn(`LATE_ACCEPT ignored: callId=${callId} arrived after terminal state (status=${callStatus}, billingSource=${billingSource || 'none'})`);
+            return;
+          }
+        }
+      }
+    } catch (e) {
+      logger.warn(`accept_call order-guard read failed for ${callId}: ${e.message} — proceeding without guard`);
+    }
+
     // Mark both users as busy
     setUserStatus(callerId, { status: 'busy', currentCallId: callId, lastStatusChange: new Date() });
     setUserStatus(recipientId, { status: 'busy', currentCallId: callId, lastStatusChange: new Date() });
@@ -647,11 +700,8 @@ export function registerCallHandlers(io, socket) {
     // safety net. Idempotent — if /api/calls/complete already billed, the
     // billingSource check below short-circuits and we skip.
     const dbForBilling = getFirestore();
-    // MUST stay in sync with BILLED_SOURCES in backgroundJobs.js (Bug C fix).
-    const ALREADY_BILLED = new Set([
-      'server', 'normal_completion', 'server_auto_end', 'disconnect_recovery',
-      'stale_call_recovery', 'client_fallback', 'admin_cleanup_2026-05-16',
-    ]);
+    // ALREADY_BILLED hoisted to module scope (see top of file) so accept_call
+    // and start_call share the same idempotency set.
     let alreadyBilled = false;
     if (dbForBilling) {
       try {
