@@ -40,6 +40,13 @@ const BILLED_SOURCES = new Set([
   'client_fallback',
   'stale_call_recovery',
   'admin_cleanup_2026-05-16',
+  // 2026-05-17: terminal markers written by initiate_call when recipient is
+  // unreachable (no socket + FCM send failed or no FCM toggle). Marks the
+  // call doc as 'handled' so heartbeat/reaper don't re-process.
+  'recipient_unreachable',
+  // 2026-05-17: written by the auto-abandon reaper when a call has been
+  // sitting in initiated/ringing for >STALE_CALL_AUTO_ABANDON_THRESHOLD_MS.
+  'reaper_auto_abandon',
 ]);
 
 // Defense-in-depth: status-based check. Extended from the original 7 statuses
@@ -308,24 +315,112 @@ function startStaleConnectionCleanup(io) {
 }
 
 // ============================================================================
-// STALE CALL REAPER — observability only (v1)
+// STALE CALL REAPER — observability + auto-abandon (v2)
 // ============================================================================
-// Detects calls stuck in non-terminal Firestore states for >2 hours.
-// 2h threshold is well above the 60-min hard call cap (HEARTBEAT_TIMEOUT_MS
-// + MAX_CALL_DURATION_SECONDS), so legitimate calls can never trigger.
+// Two-tier behavior:
 //
-// v1 = OBSERVABILITY-ONLY: only logs warnings. Does NOT mutate Firestore.
-// After 1 week of zero false positives in production, flip
-// STALE_CALL_REAPER_AUTOCLEAN to true for self-healing cleanup (out of
-// scope for this commit).
+//   Tier 1 (AUTO-ABANDON, 5 min threshold, every 5 min):
+//     Targets ONLY 'initiated' and 'ringing' status — calls that never reached
+//     an active state. These have zero billing implications (durationSeconds=0,
+//     no coinsDeducted). Auto-marks them 'abandoned' with
+//     billingSource='reaper_auto_abandon' so the call doc reaches a terminal
+//     state and reaper logs stay clean.
 //
-// Requires composite index calls(status, createdAt) deployed via
-// firestore.indexes.json in the same PR (Task 4a). If the index isn't
-// built yet, the FAILED_PRECONDITION handler below logs a clear message.
-const STALE_CALL_REAPER_AUTOCLEAN = false;
-const STALE_CALL_THRESHOLD_MS = 2 * 60 * 60 * 1000;        // 2 hours
+//     Why 5 min? CALL_RING_TIMEOUT_MS = 30s + FCM_CALL_TIMEOUT_MS = 60s, so
+//     any well-functioning call has reached terminal status within 90s of
+//     creation. 5 min is 3x the longest legitimate ring window — zero risk
+//     of catching a real in-flight call.
+//
+//     Why not earlier? Gives a safety buffer in case of network blips
+//     between the original setTimeout firing and the Firestore write.
+//
+//   Tier 2 (OBSERVABILITY, 2h threshold, every 1h):
+//     Targets ALL non-terminal statuses including 'accepted' and 'active'.
+//     Calls in these states with billing markers are already-handled (Bug C
+//     fix). Calls without billing markers >2h old indicate a deeper bug.
+//     Logged only — never mutated — because 'active' calls with real billing
+//     state need investigation, not auto-cleanup.
+//
+// Requires composite index calls(status, createdAt). Already deployed.
 const STALE_CALL_REAPER_INTERVAL_MS = 60 * 60 * 1000;       // 1 hour
+const STALE_CALL_THRESHOLD_MS = 2 * 60 * 60 * 1000;         // 2 hours — Tier 2 observability
+
+const STALE_CALL_AUTO_ABANDON_INTERVAL_MS = 5 * 60 * 1000;  // 5 min
+const STALE_CALL_AUTO_ABANDON_THRESHOLD_MS = 5 * 60 * 1000; // 5 min
+const STALE_CALL_AUTO_ABANDON_STATUSES = ['initiated', 'ringing']; // never 'accepted'/'active'
+
 const STALE_CALL_REAPER_NON_TERMINAL = ['initiated', 'ringing', 'accepted', 'active'];
+
+let staleCallAutoAbandonIntervalId = null;
+
+async function staleCallAutoAbandonTick() {
+  try {
+    const db = getFirestore();
+    if (!db) return;
+
+    const cutoff = new Date(Date.now() - STALE_CALL_AUTO_ABANDON_THRESHOLD_MS);
+    const cutoffTs = admin.firestore.Timestamp.fromDate(cutoff);
+
+    let totalAbandoned = 0;
+    const abandonedSamples = [];
+
+    for (const status of STALE_CALL_AUTO_ABANDON_STATUSES) {
+      const snap = await db.collection('calls')
+        .where('status', '==', status)
+        .where('createdAt', '<', cutoffTs)
+        .limit(100)
+        .get();
+
+      // Defensive: never auto-abandon a call that has any billing markers,
+      // even if status is 'initiated'/'ringing'. Belt and suspenders.
+      const safeDocs = [];
+      snap.forEach(d => {
+        const data = d.data();
+        const hasBilling = (data.coinsDeducted || 0) > 0
+                        || (data.durationSeconds || 0) > 0
+                        || (data.billingSource && BILLED_SOURCES.has(data.billingSource));
+        if (hasBilling) {
+          logger.warn(`AUTO_ABANDON skipping ${d.id} — has billing markers despite status=${status}`);
+          return;
+        }
+        safeDocs.push({ ref: d.ref, id: d.id, callerId: data.callerId, recipientId: data.recipientId, callType: data.callType });
+      });
+
+      // Batch update — Firestore caps at 500 per batch; 100 limit per query is safe.
+      if (safeDocs.length > 0) {
+        const batch = db.batch();
+        const now = new Date();
+        for (const doc of safeDocs) {
+          batch.update(doc.ref, {
+            status: 'abandoned',
+            previousStatus: status,
+            endedAt: now,
+            endReason: 'auto_abandon_no_response',
+            billingSource: 'reaper_auto_abandon',
+            cleanedAt: now,
+          });
+          totalAbandoned++;
+          if (abandonedSamples.length < 5) {
+            abandonedSamples.push({ id: doc.id, status, caller: doc.callerId, recipient: doc.recipientId });
+          }
+        }
+        await batch.commit();
+      }
+    }
+
+    if (totalAbandoned > 0) {
+      logger.warn(`STALE_CALL_AUTO_ABANDON: marked ${totalAbandoned} call(s) as 'abandoned' (>5min old, never reached active)`);
+      abandonedSamples.forEach(s => {
+        logger.info(`  ABANDONED: callId=${s.id} previousStatus=${s.status} caller=${s.caller} recipient=${s.recipient}`);
+      });
+    }
+  } catch (err) {
+    logger.error(`STALE_CALL_AUTO_ABANDON tick error: ${err.message}`);
+    if (err.code === 9 || /FAILED_PRECONDITION/i.test(err.message)) {
+      logger.error('STALE_CALL_AUTO_ABANDON: composite index calls(status, createdAt) is missing or still building.');
+    }
+  }
+}
 
 async function staleCallReaperTick() {
   try {
@@ -367,15 +462,10 @@ async function staleCallReaperTick() {
       return;
     }
 
-    logger.warn(`STALE_CALL_REAPER: detected ${totalFound} stale call doc(s) (>2h old in non-terminal state). AUTOCLEAN=${STALE_CALL_REAPER_AUTOCLEAN}.`);
+    logger.warn(`STALE_CALL_REAPER: detected ${totalFound} stale call doc(s) (>2h old in non-terminal state). Investigate root cause — Tier 1 auto-abandon should have caught these.`);
     samples.forEach(s => {
       logger.warn(`  STALE_CALL: callId=${s.id} status=${s.status} ageMin=${s.ageMin} caller=${s.caller} recipient=${s.recipient}`);
     });
-
-    if (STALE_CALL_REAPER_AUTOCLEAN) {
-      // Future autoclean branch — intentionally not implemented in v1
-      logger.warn('STALE_CALL_REAPER: AUTOCLEAN enabled but not yet implemented — observability-only mode');
-    }
   } catch (err) {
     logger.error(`STALE_CALL_REAPER tick error: ${err.message}`);
     if (err.code === 9 || /FAILED_PRECONDITION/i.test(err.message)) {
@@ -386,7 +476,9 @@ async function staleCallReaperTick() {
 
 function startStaleCallReaper() {
   staleCallReaperIntervalId = setInterval(staleCallReaperTick, STALE_CALL_REAPER_INTERVAL_MS);
-  logger.info(`STALE_CALL_REAPER: registered (interval ${STALE_CALL_REAPER_INTERVAL_MS / 60000}min, threshold ${STALE_CALL_THRESHOLD_MS / 60000}min, AUTOCLEAN=${STALE_CALL_REAPER_AUTOCLEAN})`);
+  staleCallAutoAbandonIntervalId = setInterval(staleCallAutoAbandonTick, STALE_CALL_AUTO_ABANDON_INTERVAL_MS);
+  logger.info(`STALE_CALL_REAPER: registered (observability tier: interval ${STALE_CALL_REAPER_INTERVAL_MS / 60000}min threshold ${STALE_CALL_THRESHOLD_MS / 60000}min)`);
+  logger.info(`STALE_CALL_AUTO_ABANDON: registered (auto-abandon tier: interval ${STALE_CALL_AUTO_ABANDON_INTERVAL_MS / 60000}min threshold ${STALE_CALL_AUTO_ABANDON_THRESHOLD_MS / 60000}min statuses=${STALE_CALL_AUTO_ABANDON_STATUSES.join(',')})`);
 }
 
 export function startBackgroundJobs(io) {
@@ -403,6 +495,7 @@ export function stopBackgroundJobs() {
   if (memoryCheckIntervalId) clearInterval(memoryCheckIntervalId);
   if (staleCleanupIntervalId) clearInterval(staleCleanupIntervalId);
   if (staleCallReaperIntervalId) clearInterval(staleCallReaperIntervalId);
+  if (staleCallAutoAbandonIntervalId) clearInterval(staleCallAutoAbandonIntervalId);
   stopMarketingNotificationJob();
   logger.info('Background jobs stopped');
 }
